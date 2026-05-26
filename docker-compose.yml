@@ -1,0 +1,79 @@
+# docker-compose.yml — Multi-Agent Pipeline v2
+#
+# Services:
+#   agent   — FastAPI web server (Web UI at http://localhost:8000)
+#   ollama  — Local LLM server (optional, remove if using Anthropic only)
+#
+# Usage:
+#   # Anthropic only (no local models):
+#   docker compose up agent
+#
+#   # With Ollama:
+#   docker compose up
+#   docker compose exec ollama ollama pull qwen2.5:7b
+
+version: "3.9"
+
+services:
+
+  # ── Web server (main app) ──────────────────────────────────────────────────
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./workspace:/workspace          # persist generated code
+      - ./.env:/app/.env:ro             # mount .env (read-only)
+    environment:
+      - AGENT_HOST=0.0.0.0
+      - AGENT_PORT=8000
+      - AGENT_WORKSPACE=/workspace
+      # Override individual agents to use Ollama when available:
+      # - CODER_BACKEND=ollama
+      # - CODER_BASE_URL=http://ollama:11434/v1
+      # - CODER_MODEL=qwen2.5:14b
+      # - TESTER_BACKEND=ollama
+      # - TESTER_BASE_URL=http://ollama:11434/v1
+      # - TESTER_MODEL=qwen2.5:7b
+    depends_on:
+      ollama:
+        condition: service_healthy
+        required: false           # don't fail if ollama is not in the profile
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # ── Ollama (optional local LLM) ────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local"]           # only starts with: docker compose --profile local up
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - agents
+    # GPU support (uncomment if you have NVIDIA GPU + nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  ollama_data:
+
+networks:
+  agents:
+    driver: bridge

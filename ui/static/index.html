@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Multi-Agent v2</title>
+<style>
+:root {
+  --bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--border:rgba(255,255,255,.08);
+  --text:#e6edf3;--muted:#768390;--dim:#484f58;
+  --purple:#a78bfa;--teal:#34d399;--amber:#fbbf24;--red:#f87171;--blue:#60a5fa;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--border);flex-shrink:0}
+header h1{font-size:13px;font-weight:600;letter-spacing:.02em}
+#dot{width:7px;height:7px;border-radius:50%;background:var(--dim);transition:background .3s;flex-shrink:0}
+#dot.running{background:#4ade80;animation:pulse 1.4s ease-in-out infinite}
+#dot.done{background:var(--teal)}
+#dot.error{background:var(--red)}
+#stxt{font-size:11px;color:var(--muted);margin-left:auto}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.layout{display:grid;grid-template-columns:250px 1fr 240px;height:calc(100vh - 44px);overflow:hidden}
+.panel{display:flex;flex-direction:column;border-right:1px solid var(--border);overflow:hidden}
+.panel:last-child{border-right:none;border-left:1px solid var(--border)}
+.ptitle{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);padding:10px 14px 6px;flex-shrink:0}
+
+/* Left */
+#lpanel{background:var(--bg2)}
+textarea{margin:0 10px 8px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:7px;padding:9px 11px;font-size:12px;resize:none;outline:none;font-family:inherit;line-height:1.5;height:100px;transition:border-color .2s}
+textarea:focus{border-color:rgba(255,255,255,.2)}
+.opt{display:flex;align-items:center;gap:7px;padding:0 10px 8px;font-size:11px;color:var(--muted);cursor:pointer}
+.runbtn{margin:0 10px 14px;padding:8px;background:#238636;color:#fff;border:none;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;transition:background .15s;width:calc(100% - 20px)}
+.runbtn:hover{background:#2ea043}
+.runbtn:disabled{background:var(--bg3);color:var(--dim);cursor:not-allowed}
+.cards{display:flex;flex-direction:column;gap:7px;padding:0 10px 10px}
+.card{border:1px solid var(--border);border-radius:7px;padding:9px 11px;transition:border-color .2s,background .2s}
+.card.active{border-color:rgba(167,139,250,.5);background:rgba(167,139,250,.04)}
+.card.done{border-color:rgba(52,211,153,.4);background:rgba(52,211,153,.03)}
+.card.error{border-color:rgba(248,113,113,.4)}
+.card .nm{font-size:11px;font-weight:600;display:flex;align-items:center;gap:7px}
+.card .sb{font-size:10px;color:var(--muted);margin-top:2px}
+.badge{font-size:9px;padding:1px 6px;border-radius:9px;font-weight:500}
+.badge.idle{background:var(--bg3);color:var(--dim)}
+.badge.running{background:rgba(167,139,250,.2);color:var(--purple)}
+.badge.done{background:rgba(52,211,153,.15);color:var(--teal)}
+.badge.error{background:rgba(248,113,113,.15);color:var(--red)}
+.iter-badge{font-size:10px;color:var(--muted);padding:4px 10px;text-align:center}
+
+/* Feed */
+#fpanel{background:var(--bg)}
+#feed{flex:1;overflow-y:auto;padding:6px 14px 14px;display:flex;flex-direction:column;gap:2px}
+.fi{display:flex;gap:8px;align-items:flex-start;font-size:12px;line-height:1.55;padding:3px 0}
+.fi-ico{font-size:12px;flex-shrink:0;width:16px;text-align:center;margin-top:1px}
+.fi-c{flex:1;min-width:0}
+.ftag{font-size:9px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-right:7px}
+.ftag.architect{color:var(--purple)}
+.ftag.coder{color:var(--teal)}
+.ftag.tester{color:var(--blue)}
+.ftag.reviewer{color:var(--amber)}
+.ftag.pipeline{color:var(--muted)}
+.fb{color:var(--muted);word-break:break-word;white-space:pre-wrap}
+.fb.thought{color:var(--text)}
+.fb.streaming{color:var(--text)}
+.fb.tool{color:var(--amber);font-family:'Menlo','Consolas',monospace;font-size:11px}
+.fb.result{color:var(--dim);font-family:'Menlo','Consolas',monospace;font-size:10.5px}
+.fb.done{color:#4ade80}
+.fb.iter{color:var(--blue)}
+.fb.error{color:var(--red)}
+.cursor{display:inline-block;width:7px;height:12px;background:var(--text);vertical-align:middle;animation:blink .8s step-end infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.empty{color:var(--dim);font-size:12px;margin:auto;text-align:center;padding:30px 16px}
+
+/* Files */
+#rpanel{background:var(--bg2)}
+#flist{flex:1;overflow-y:auto;padding:0 6px 8px}
+.fitem{display:flex;gap:7px;align-items:center;padding:4px 7px;border-radius:5px;cursor:pointer;font-size:11px;transition:background .12s}
+.fitem:hover{background:var(--bg3)}
+.fitem .fn{color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fitem .fs{color:var(--dim);font-size:9px;flex-shrink:0}
+
+/* Viewer */
+#viewer{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:100;align-items:center;justify-content:center;padding:20px}
+#viewer.open{display:flex}
+#vbox{background:var(--bg2);border:1px solid var(--border);border-radius:10px;max-width:740px;width:100%;max-height:82vh;display:flex;flex-direction:column}
+#vhdr{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border)}
+#vpath{font-size:12px;font-weight:600}
+#vclose{background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;line-height:1}
+#vclose:hover{color:var(--text)}
+#vcontent{overflow-y:auto;padding:14px;font-family:'Menlo','Consolas',monospace;font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:3px}
+.tab{background:none;border:none;color:var(--muted);font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:10px 12px;cursor:pointer;border-bottom:2px solid transparent;flex:1;text-align:center;transition:all .15s}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--text);border-bottom-color:var(--purple)}
+.hitem{padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;font-size:11px}
+.hitem:hover{background:var(--bg3)}
+.hitem .htask{color:var(--text);font-weight:500;margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hitem .hmeta{color:var(--dim);font-size:10px;display:flex;gap:8px}
+.hitem .hv{font-size:9px;padding:1px 5px;border-radius:8px;font-weight:600}
+.hv.PASS{background:rgba(52,211,153,.15);color:var(--teal)}
+.hv.FAIL{background:rgba(248,113,113,.15);color:var(--red)}
+.pitem{padding:6px 10px;font-size:11px;display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--border)}
+.pitem .pname{color:var(--text);font-weight:500}
+.pitem .pagents{color:var(--dim);font-size:10px}
+
+/* Live writing indicator */
+#writing-indicator{display:none;padding:8px 10px;font-size:11px;border-bottom:1px solid var(--border);background:rgba(52,211,153,.06)}
+#writing-indicator.active{display:flex;align-items:center;gap:8px}
+.write-pulse{width:6px;height:6px;border-radius:50%;background:var(--teal);animation:pulse 1s ease-in-out infinite;flex-shrink:0}
+.fitem.new-file{animation:highlight-new .8s ease-out}
+@keyframes highlight-new{0%{background:rgba(52,211,153,.25)}100%{background:transparent}}
+</style>
+</head>
+<body>
+<header>
+  <div id="dot"></div>
+  <h1>Multi-Agent Pipeline v2</h1>
+  <span id="stxt">idle</span>
+</header>
+<div class="layout">
+
+  <!-- Left -->
+  <div class="panel" id="lpanel">
+    <div class="ptitle">Task</div>
+    <textarea id="tinput" placeholder="Describe what to build…"></textarea>
+    <label class="opt"><input type="checkbox" id="cclean"> Clean workspace</label>
+    <label class="opt"><input type="checkbox" id="cplanner"> 🧠 Planner mode (auto-decompose)</label>
+    <button class="runbtn" id="rbtn" onclick="startRun()">▶ Run pipeline</button>
+
+    <div class="ptitle">Agents</div>
+    <div id="route-badge" style="margin:0 10px 8px;padding:5px 10px;border-radius:6px;font-size:11px;background:var(--bg3);color:var(--muted);display:none"></div>
+
+    <div class="ptitle" id="pt-coding">⌨️ Coding</div>
+    <div class="cards" id="cards-coding">
+      <div class="card" id="c-planner">  <div class="nm">🧠 Planner   <span class="badge idle" id="b-planner">idle</span></div>  <div class="sb">Decomposes task</div></div>
+      <div class="card" id="c-architect"><div class="nm">🏛 Architect <span class="badge idle" id="b-architect">idle</span></div><div class="sb">Plans structure</div></div>
+      <div class="card" id="c-coder">   <div class="nm">⌨️ Coder     <span class="badge idle" id="b-coder">idle</span></div>    <div class="sb">Writes code</div></div>
+      <div class="card" id="c-tester">  <div class="nm">🧪 Tester    <span class="badge idle" id="b-tester">idle</span></div>   <div class="sb">Runs tests</div></div>
+      <div class="card" id="c-reviewer"><div class="nm">🔍 Reviewer  <span class="badge idle" id="b-reviewer">idle</span></div> <div class="sb">Reviews code</div></div>
+    </div>
+
+    <div class="ptitle" id="pt-research">🔬 Research</div>
+    <div class="cards" id="cards-research">
+      <div class="card" id="c-researcher"><div class="nm">🔬 Researcher <span class="badge idle" id="b-researcher">idle</span></div><div class="sb">Searches web</div></div>
+      <div class="card" id="c-writer">   <div class="nm">✍️ Writer     <span class="badge idle" id="b-writer">idle</span></div>   <div class="sb">Writes document</div></div>
+      <div class="card" id="c-editor">   <div class="nm">✅ Editor     <span class="badge idle" id="b-editor">idle</span></div>   <div class="sb">Reviews quality</div></div>
+    </div>
+    <div id="iter-info" class="iter-badge"></div>
+  </div>
+
+  <!-- Feed -->
+  <div class="panel" id="fpanel">
+    <div class="ptitle">Live feed</div>
+    <div id="feed"><div class="empty" id="emsg">Run a task to see activity.</div></div>
+  </div>
+
+  <!-- Files -->
+  <div class="panel" id="rpanel">
+    <div style="display:flex;gap:0;border-bottom:1px solid var(--border)">
+      <button class="tab active" id="tab-files" onclick="showTab('files')">Workspace</button>
+      <button class="tab" id="tab-history" onclick="showTab('history')">History</button>
+      <button class="tab" id="tab-plugins" onclick="showTab('plugins')">Plugins</button>
+    </div>
+    <div id="writing-indicator">
+      <div class="write-pulse"></div>
+      <span id="writing-name" style="color:var(--teal);font-weight:500"></span>
+      <span style="color:var(--dim)">writing...</span>
+    </div>
+    <div id="pane-files" style="flex:1;overflow-y:auto">
+      <div id="flist"></div>
+    </div>
+    <div id="pane-history" style="flex:1;overflow-y:auto;display:none">
+      <div id="hlist"></div>
+    </div>
+    <div id="pane-plugins" style="flex:1;overflow-y:auto;display:none">
+      <div id="plist"></div>
+      <button class="runbtn" style="margin:8px 10px;width:auto;font-size:11px;padding:5px 12px" onclick="reloadPlugins()">↻ Reload</button>
+    </div>
+  </div>
+</div>
+
+<div id="viewer">
+  <div id="vbox">
+    <div id="vhdr"><span id="vpath"></span><button id="vclose" onclick="closeV()">✕</button></div>
+    <pre id="vcontent"></pre>
+  </div>
+</div>
+
+<script>
+let ws, streamRow = null;
+
+const icons = {
+  agent_start:"◆", token:"", thought:"💭", tool_call:"⚡",
+  tool_result:"↩", agent_done:"✓", iteration:"↻", pipeline_done:"🎉", error:"✗"
+};
+const researchAgents = new Set(["researcher","writer","editor"]);
+const bodyClass = {
+  agent_start:"", thought:"thought", tool_call:"tool", tool_result:"result",
+  agent_done:"done", iteration:"iter", pipeline_done:"done", error:"error"
+};
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = e => handle(JSON.parse(e.data));
+  ws.onclose   = () => setTimeout(connect, 2000);
+}
+
+function handle(ev) {
+  const {agent, type, data} = ev;
+
+  if (type === "tool_call" && data.tool === "write_file") {
+    handle._lastWritePath = data.args?.path || null;
+    document.getElementById("writing-indicator").classList.add("active");
+    document.getElementById("writing-name").textContent = handle._lastWritePath || "";
+    showTab("files");
+  }
+  if (type === "tool_result" && data.tool === "write_file") {
+    document.getElementById("writing-indicator").classList.remove("active");
+    refreshFiles(handle._lastWritePath);
+    handle._lastWritePath = null;
+  }
+  if (type === "agent_start") {
+    if (data.stage === "router") {
+      const badge = document.getElementById("route-badge");
+      badge.style.display = "block";
+      badge.textContent = "→ " + (data.task_type||"").toUpperCase() + ": " + (data.reason||"");
+    }
+    setCard(agent,"active","running"); refreshFiles();
+  }
+  if (type === "agent_done")  { setCard(agent,"done","done"); refreshFiles(); }
+  if (type === "error" && agent !== "pipeline") setCard(agent,"error","error");
+  if (type === "tool_result" && data.tool !== "write_file") refreshFiles();
+  if (type === "iteration") {
+    document.getElementById("iter-info").textContent = `Iteration ${data.n} — fixing issues`;
+    setCard("coder","","idle"); setCard("tester","","idle"); setCard("reviewer","","idle");
+  }
+  if (type === "pipeline_done") {
+    setStatus("done", `done · ${data.verdict||""} · ${data.iterations} iter`);
+    document.getElementById("rbtn").disabled = false;
+    refreshFiles();
+  }
+
+  // Streaming: accumulate tokens into a live row
+  if (type === "token") {
+    if (!streamRow) streamRow = addRow(agent, "token", "", "streaming");
+    const body = streamRow.querySelector(".fb");
+    body.textContent = body.textContent.replace("▌","") + data.chunk + "▌";
+    document.getElementById("feed").scrollTop = 99999;
+    return;
+  }
+
+  // Flush stream row into a thought row on completion
+  if (type === "thought" && streamRow) {
+    streamRow.querySelector(".fb").textContent = data.text;
+    streamRow.querySelector(".fb").className = "fb thought";
+    streamRow = null;
+    return;
+  }
+
+  if (type !== "token") {
+    streamRow = null;
+    addEventRow(agent, type, data);
+  }
+}
+
+function addEventRow(agent, type, data) {
+  let body = "";
+  if (type === "agent_start")   body = (data.task||"").slice(0,120);
+  else if (type === "thought")  body = data.text||"";
+  else if (type === "tool_call") {
+    const a = JSON.stringify(data.args||{});
+    body = `${data.tool}(${a.slice(0,160)}${a.length>160?"…":""})`;
+  }
+  else if (type === "tool_result") body = (data.result||"").slice(0,250)+(data.result?.length>250?"…":"");
+  else if (type === "agent_done")  body = (data.output||"").slice(0,200)+(data.verdict?" · "+data.verdict:"");
+  else if (type === "iteration")   body = `Revision ${data.n} — ${data.reason||""}`;
+  else if (type === "pipeline_done") body = `All done · verdict: ${data.final_verdict||data.verdict||"?"}`;
+  else if (type === "error")       body = data.message||"";
+  addRow(agent, type, body, bodyClass[type]||"");
+}
+
+function addRow(agent, type, body, cls) {
+  const feed = document.getElementById("feed");
+  document.getElementById("emsg")?.remove();
+  const row = document.createElement("div");
+  row.className = "fi";
+  row.innerHTML = `<div class="fi-ico">${icons[type]||"·"}</div>
+    <div class="fi-c">
+      <span class="ftag ${agent}">${agent}</span>
+      <span class="fb ${cls}">${esc(body)}</span>
+    </div>`;
+  feed.appendChild(row);
+  feed.scrollTop = feed.scrollHeight;
+  return row;
+}
+
+function setCard(agent, cardCls, badgeCls) {
+  const card  = document.getElementById(`c-${agent}`);
+  const badge = document.getElementById(`b-${agent}`);
+  if (!card) return;
+  card.className  = `card ${cardCls}`;
+  badge.className = `badge ${badgeCls}`;
+  badge.textContent = badgeCls||"idle";
+}
+
+function setStatus(state, text) {
+  document.getElementById("dot").className = state;
+  document.getElementById("stxt").textContent = text;
+}
+
+async function startRun() {
+  const task  = document.getElementById("tinput").value.trim();
+  const clean = document.getElementById("cclean").checked;
+  if (!task) return;
+  document.getElementById("rbtn").disabled = true;
+  document.getElementById("feed").innerHTML = "";
+  document.getElementById("flist").innerHTML = "";
+  document.getElementById("iter-info").textContent = "";
+  ["planner","architect","coder","tester","reviewer","researcher","writer","editor"].forEach(a => setCard(a,"","idle"));
+  document.getElementById("route-badge").style.display="none";
+  setStatus("running","running…");
+  streamRow = null;
+  const planner = document.getElementById("cplanner").checked;
+  const endpoint = planner ? "/run/planner" : "/run";
+  await fetch(endpoint, {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({task, clean})});
+}
+
+async function refreshFiles(newFilePath) {
+  const data = await fetch("/files").then(r=>r.json());
+  const list = document.getElementById("flist");
+  const prevFiles = new Set([...list.querySelectorAll(".fitem")].map(r=>r.dataset.path));
+  list.innerHTML = "";
+  if (!data.files?.length) { list.innerHTML=`<div style="padding:10px 14px;font-size:11px;color:var(--dim)">No files yet</div>`; return; }
+  for (const f of data.files) {
+    const ext  = f.path.split(".").pop()||"";
+    const ico  = {py:"🐍",md:"📝",txt:"📄",js:"🟨",ts:"🔷",json:"📋",yaml:"⚙",yml:"⚙",toml:"⚙",sh:"⚡",html:"🌐",css:"🎨"}[ext]||"📄";
+    const row  = document.createElement("div");
+    row.className = "fitem";
+    row.dataset.path = f.path;
+    if (newFilePath === f.path || !prevFiles.has(f.path)) row.classList.add("new-file");
+    row.onclick   = () => openFile(f.path);
+    row.innerHTML = `<span>${ico}</span><span class="fn">${esc(f.path)}</span><span class="fs">${fmt(f.bytes)}</span>`;
+    list.appendChild(row);
+  }
+  if (newFilePath && /\.(py|js|ts|html|css|json|md)$/.test(newFilePath)) {
+    openFile(newFilePath);
+  }
+}
+
+async function openFile(path) {
+  const data = await fetch(`/files/${path}`).then(r=>r.json());
+  document.getElementById("vpath").textContent    = path;
+  document.getElementById("vcontent").textContent = data.content||"(empty)";
+  document.getElementById("viewer").classList.add("open");
+}
+
+function closeV() { document.getElementById("viewer").classList.remove("open"); }
+document.getElementById("viewer").onclick = e => { if(e.target===document.getElementById("viewer")) closeV(); };
+
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function fmt(b) { return b<1024?b+"B":b<1048576?(b/1024).toFixed(1)+"KB":(b/1048576).toFixed(1)+"MB"; }
+
+connect();
+
+// ── Tabs ────────────────────────────────────────────────────────────────────
+function showTab(tab) {
+  ["files","history","plugins"].forEach(t => {
+    document.getElementById("pane-"+t).style.display = t===tab?"block":"none";
+    document.getElementById("tab-"+t).className = t===tab?"tab active":"tab";
+  });
+  if(tab==="history") loadHistory();
+  if(tab==="plugins") loadPlugins();
+}
+
+// ── History ─────────────────────────────────────────────────────────────────
+async function loadHistory() {
+  const data = await fetch("/api/runs").then(r=>r.json());
+  const list = document.getElementById("hlist");
+  list.innerHTML = "";
+  if(!data.runs?.length){ list.innerHTML=`<div style="padding:12px;font-size:11px;color:var(--dim)">No runs yet</div>`; return; }
+  for(const run of data.runs){
+    const dur = run.duration ? (run.duration/60).toFixed(1)+"m" : "...";
+    const date = new Date(run.started_at*1000).toLocaleString();
+    const row = document.createElement("div");
+    row.className = "hitem";
+    row.onclick = () => loadRunDetail(run.id);
+    row.innerHTML = `
+      <div class="htask">${esc(run.task.slice(0,80))}</div>
+      <div class="hmeta">
+        <span class="hv ${run.verdict||''}">${run.verdict||run.status}</span>
+        <span>${run.task_type}</span>
+        <span>${dur}</span>
+        <span>${date}</span>
+      </div>`;
+    list.appendChild(row);
+  }
+}
+
+async function loadRunDetail(runId) {
+  const data = await fetch("/api/runs/"+runId+"/events").then(r=>r.json());
+  // Show events in feed
+  const feed = document.getElementById("feed");
+  feed.innerHTML = "";
+  document.getElementById("stxt").textContent = "viewing run #"+runId;
+  for(const ev of data.events){
+    addEventRow(ev.agent, ev.type, ev.data);
+  }
+  // Load files for that run
+  const files = await fetch("/api/runs/"+runId+"/files").then(r=>r.json());
+  const flist = document.getElementById("flist");
+  flist.innerHTML = "";
+  for(const f of files.files||[]){
+    const row = document.createElement("div");
+    row.className = "fitem";
+    row.onclick = () => openHistoryFile(f.id);
+    row.innerHTML = `<span>📄</span><span class="fn">${esc(f.path)}</span><span class="fs">${fmt(f.size)}</span>`;
+    flist.appendChild(row);
+  }
+  showTab("files");
+}
+
+async function openHistoryFile(fileId) {
+  const data = await fetch("/api/runs/0/files/"+fileId).then(r=>r.json());
+  document.getElementById("vpath").textContent = "history file";
+  document.getElementById("vcontent").textContent = data.content||"(empty)";
+  document.getElementById("viewer").classList.add("open");
+}
+
+// ── Plugins ─────────────────────────────────────────────────────────────────
+async function loadPlugins() {
+  const data = await fetch("/api/plugins").then(r=>r.json());
+  const list = document.getElementById("plist");
+  list.innerHTML = "";
+  if(!data.plugins?.length){ list.innerHTML=`<div style="padding:12px;font-size:11px;color:var(--dim)">No plugins loaded</div>`; return; }
+  for(const p of data.plugins){
+    const row = document.createElement("div");
+    row.className = "pitem";
+    row.innerHTML = `<span class="pname">⚡ ${esc(p.name)}</span><span class="pagents">${p.agents}</span>`;
+    list.appendChild(row);
+  }
+}
+
+async function reloadPlugins() {
+  const data = await fetch("/api/plugins/reload",{method:"POST"}).then(r=>r.json());
+  loadPlugins();
+}
+</script>
+</body>
+</html>
