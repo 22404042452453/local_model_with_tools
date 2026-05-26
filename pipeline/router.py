@@ -109,9 +109,31 @@ class RouterPipeline:
             await q.put(event)
 
     async def run(self, task: str, clean_workspace: bool = False):
+        # ── History: open run record ──────────────────────────────────────────
+        _history = None
+        _run_id  = None
+        try:
+            from storage.history import History
+            from pathlib import Path
+            _history = History(str(Path(self.config.workspace).parent / "runs.db"))
+            _run_id  = _history.start_run(task, task_type="pending")
+        except Exception:
+            pass
+
         # ── Step 1: classify ──────────────────────────────────────────────────
         router   = Router(self.config)
         decision = await router.classify(task)
+
+        # Update history task_type now that we know it
+        if _history and _run_id:
+            try:
+                _history.conn.execute(
+                    "UPDATE runs SET task_type=? WHERE id=?",
+                    (decision.task_type, _run_id)
+                )
+                _history.conn.commit()
+            except Exception:
+                pass
 
         await self._emit(Event("pipeline", "agent_start", {
             "task":      f"Router → {decision.task_type.upper()}",
@@ -150,4 +172,13 @@ class RouterPipeline:
             pipeline.run(task, clean_workspace=clean_workspace),
             asyncio.create_task(forward()),
         )
+
+        # ── History: close run record ─────────────────────────────────────────
+        if _history and _run_id:
+            try:
+                verdict = getattr(result, "final_verdict", "FAIL") if result else "FAIL"
+                _history.finish_run(_run_id, verdict)
+            except Exception:
+                pass
+
         return result

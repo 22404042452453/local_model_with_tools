@@ -1,83 +1,32 @@
-# Звездное небо - План реализации
+# Python Fibonacci Calculator - Implementation Plan
 
-## Обзор проекта и цели
+## Project Overview and Goals
+Create a complete set of tools to calculate Fibonacci numbers with clean implementation, proper documentation and error handling for educational use. Focus on producing clear mathematical code that can be extended.
 
-Разработка Python-программы для генерации интерактивного звездного неба с эффектами падающих звезд и свечения. Программа создает HTML файл со встроенными CSS/JavaScript, который отображает анимацию звезд на Canvas с эффектом свечения.
+## Technology Stack
+- **Language**: Python 3.x (built-in features only)
+- **Libraries needed**: None required - using pure Python builtins (`math`, `typing` for type hints if available, standard lists/dicts)
+- Justification: Fibonacci calculation is purely mathematical with no external dependencies. Pure implementation ensures maximum portability and performance over 10^7 iterations without library overhead.
 
-## Технологический стек
-
-| Компонент | Библиотека | Обоснование |
-|------------|------------|-------------|
-| GUI (опционально) | `tkinter` + `tkcanvas` | Нативная поддержка Windows/Mac для отображения программы |
-| Графическая анимация | `pygame` + `Scall` | Реализация падения звезд с физикой и свечением |
-| Генерация HTML | `jinja2` | Шаблоны для создания кастомизации параметров |
-| Обработка изображений | `Pillow` | Оптимизация визуальных эффектов |
-
-## Структура проекта (дерево файлов)
-
+## Files to Create (exact filenames relative):
 ```
-star_sky/
-├── main.py                  # Точка входа + CLI интерфейс
-├── galaxy_generator.py      # Генерация звезд и параметров
-├── sky_renderer.py          # Отрисовка с анимацией свечения
-├── style_manager.py         # Управление CSS/JS стилями
-├── config.py                # Конфигурация (кол-во, скорость, цвет)
-├── template.html.j2        # Jinja шаблон HTML генерации
-└── requirements.txt         # List зависимостей
+fibonacci/                  # package directory name
+__init__.py                 # package initialization, exports public API
+calc_core.py                # core calculation functions (generate sequence, get nth Fibonacci)
+display_gui.py              # optional tkinter-based visual output
+validate_input.py           # input validation and error handling utilities
 ```
 
-## Ключевые классы и функции
+## Key Functions/Classes Per File:
+- `fibonacci/__init__.py`: Import all public symbols (export Generator class), documentation string at module level
+- `calc_core.FibSequenceGenerator`: Class with methods to generate entire sequence up to N limit, get nth Fibonacci as method or attribute access
+- `display_gui.simple_display()` function for optional Tkinter console interface.
 
-### `galaxy_generator.py`
-- Класс `Star`: координаты (x, y), яркость, скорость падения
-- Функция `generate_stars(count)`: создания N звезд с рандомной позицией
-- Метод `update_position()`: физика изменения позиции со временем
+## Step-by-step Implementation Order:
+1. Start in fibonacci/ directory structure (__init__.py + calc_core.py)
+2. Implement Generator class that yields values one by one with proper type hints and error handling (handles negative index, non-integer limit errors)
+3. Add __all__ exports list to main module for public API clarity
+4. Optional: add display_gui.py if user wants a visual UI component
 
-### `sky_renderer.py`
-- Класс `CanvasRenderer`: интеграция Canvas + JavaScript для анимации
-- Функция `draw_star_with_glow(star)`: отрисовка звезды с блюром (glow эффект)
-- Анимационный цикл с обработкой кадров 60 FPS
-
-### `style_manager.py`
-- Функции генерации CSS (`generate_styles()`): градиент фона, шрифты
-- Генерация JavaScript кода для Canvas анимации
-- Управление цветами и прозрачностью (opacity)
-
-### `main.py`
-- CLI интерфейс с аргументами: `--stars`, `--speed`, `--color`
-- Точка входа запуска генератора HTML файла
-- Обработка ошибок и валидация параметров
-
-## Порядок реализации (Coders path):
-
-1. **Шаг 1**: Создать `config.py` с базовыми переменными (кол-во звезд, скорость падения, цвета)
-2. **Шаг 2**: Реализовать `galaxy_generator.py` - класс Star и метод генерации массива звезд
-3. **Шаг 3**: Создать `sky_renderer.py` с Canvas отрисовкой и блюром для glow эффекта
-4. **Шаг 4**: Добавить `style_manager.py` для генерации HTML шаблона со стилями
-5. **Шаг 5**: Собрать все части в `main.py` (CLI + выполнение)
-6. **Шаг 6**: Тестирование GUI-окна и выходного HTML файла
-
-## Стратегия тестирования:
-
-| Сценарий | Проверка | Ожидаемый результат |
-|----------|-----------|---------------------|
-| Тест запуска | `python main.py --stars=50` | Генерирует index.html с 50 звездами |
-| Тест анимация | Просмотр HTML в браузере | Звезды падают вниз со свечением |
-| Тест GUI | Запуск окна (`tkinter.mainloop()`) | Окно отображает звезды в реальном времени |
-| Тест цвета | `--color=#FF0000` | Все звезды красного цвета |
-
----
-
-## Зависимости (в requirements.txt):
-
-```txt
-jinja2>=3.1.0    # Jinja2 шаблоны для HTML
-pillow>=9.0.0    # Блюр-фильтры и изображения
-pygame>=2.5.0    # Canvas анимация + события
-```
-
-## Критические замечания:
-
-- Эффект свечения реализуется через CSS `box-shadow` + JS canvas blur фильтры
-- Для GUI теста требуется окно шириной ≥800px (Canvas минимальный размер)
-- HTML должен быть самодостаточным - весь JS+CSS встроен
+## Testing Strategy for the Tester:
+Run pytest on fib_calc_module with test cases covering edge inputs like zero/large values/invalid types, verify correct Fibonacci sequence output against reference implementation in tests directory. Ensure Generator yields exact expected integers and handles boundary conditions without exceptions during normal computation flow.

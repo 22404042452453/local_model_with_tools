@@ -125,15 +125,25 @@ class StepAgent:
     ) -> tuple[bool, dict]:
         """
         Execute steps in sequence.
-
-        context: shared dict passed between steps (for on_result callbacks)
-        Returns (success, context)
+        Emits progress events so UI shows what's happening.
         """
+        total = len(steps)
         for i, step in enumerate(steps):
+            # Emit progress: "Step 2/8: Write file: main.py"
+            short_desc = step.prompt.split("\n")[0][:80]
+            if step.expect:
+                short_desc = f"{step.expect}  →  {short_desc}"
+            await emit(Event(self.name, "agent_start", {
+                "task": f"Step {i+1}/{total}: {short_desc}",
+                "stage": "step_progress",
+                "step": i+1,
+                "total": total,
+            }))
+
             ok = await self._run_step(step, i, context, emit)
             if not ok and step.required:
                 await emit(Event.error(self.name,
-                    f"Required step {i+1} failed: {step.prompt[:60]}"))
+                    f"Required step {i+1}/{total} failed: {short_desc}"))
                 return False, context
         return True, context
 
@@ -148,9 +158,9 @@ class StepAgent:
 
         for attempt in range(step.max_retries + 1):
             if attempt > 0:
-                await emit(Event("pipeline", "agent_start", {
-                    "task":  f"Retry step {index+1}/{attempt}: {step.prompt[:50]}",
-                    "stage": "step_retry",
+                short = step.prompt.split("\n")[0][:60]
+                await emit(Event(self.name, "thought", {
+                    "text": f"Retry {attempt}/{step.max_retries}: {short}",
                 }))
 
             result, tool_name = await self._call_step(step, context, emit, attempt)
@@ -285,10 +295,47 @@ class StepAgent:
         prefix = self._no_think_prefix()
         lines = [prefix + step.prompt]
 
-        # Few-shot example for write_file
+        # ── Fix 1: Cross-Step Context ─────────────────────────────────────────
+        # inject already-written functions so implement steps are consistent.
+        # Without this, Star.draw() doesn't know what instance vars __init__ set.
+        if step.expect == "write_file" and not step.args:
+            pieces = context.get("_pieces", [])
+            if pieces:
+                summary_lines = []
+                for p in pieces[-6:]:          # last 6 to avoid context bloat
+                    name  = p.get("name", "?")
+                    cls   = p.get("class", "")
+                    code  = p.get("code", "")
+                    # Extract first non-empty, non-pass line as a hint
+                    hint  = _extract_signature_hint(code)
+                    label = f"{cls}.{name}" if cls else name
+                    summary_lines.append(f"  • {label}: {hint}")
+                if summary_lines:
+                    lines.append(
+                        "\n── Already written in this file ──\n"
+                        + "\n".join(summary_lines)
+                        + "\nUse consistent variable names and call signatures with the above."
+                    )
+
+        # ── read_file: inject files_list so model knows which file to read ────
+        if step.expect == "read_file" and not step.args and "files_list" in context:
+            files_raw = str(context["files_list"])
+            skip = {"test_", "__init__", "plan.md", "review.md"}
+            py_candidates = []
+            for ln in files_raw.splitlines():
+                name = ln.strip().split()[0] if ln.strip() else ""
+                if name.endswith(".py") and not any(s in name for s in skip):
+                    py_candidates.append(name)
+            if py_candidates:
+                target = py_candidates[0]
+                lines.append(
+                    f"\nWorkspace files:\n{files_raw[:400]}\n"
+                    f"Call read_file(path=\"{target}\") now."
+                )
+
+        # ── write_file few-shot example ───────────────────────────────────────
         if step.expect == "write_file" and not step.args:
             file = context.get("_current_file", "main.py")
-            # Infer a good example from context
             plan = context.get("plan_content", "")
             if "fastapi" in plan.lower() or "FastAPI" in plan:
                 example_code = "from fastapi import FastAPI\\napp = FastAPI()"
@@ -298,17 +345,40 @@ class StepAgent:
                 example_code = "# Complete implementation\\ndef main():\\n    pass"
             lines.append(_few_shot_write(file, example_code))
 
-        # Add previous error context on retry — be specific
+        # ── Fix 2: Self-Debug on retry ────────────────────────────────────────
+        # Research: Self-Debugging (Chen et al., ICLR 2024) — making the model
+        # explain the error before rewriting gives +2-9% accuracy.
+        # On attempt > 0: inject the error + ask for explanation first.
         err_key = f"_step_{id(step)}_error"
         if attempt > 0:
             err = context.get(err_key, "unknown error")
-            lines.append(
-                f"\n❌ Previous attempt #{attempt} failed: {err}\n"
-                f"Fix the issue and try again. "
-                f"Make sure to use RELATIVE paths (e.g. 'main.py' not '/main.py')."
-            )
+            if attempt == 1:
+                # First retry: ask model to explain the error, then fix
+                lines.append(
+                    f"\n❌ Previous attempt failed: {err}\n"
+                    f"Before rewriting, explain in ONE sentence what caused this error "
+                    f"and what you will change. Then call write_file with the fix."
+                )
+            else:
+                # Second retry: direct fix instruction with no extra thinking
+                lines.append(
+                    f"\n❌ Attempt {attempt} failed: {err}\n"
+                    f"Fix ONLY the specific error above. "
+                    f"Use RELATIVE paths (e.g. 'main.py' not '/main.py')."
+                )
 
         return "\n".join(lines)
+
+
+def _extract_signature_hint(code: str) -> str:
+    """Pull the first meaningful line from a piece of code as a hint."""
+    if not code:
+        return "(empty)"
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and stripped != "pass":
+            return stripped[:80] + ("…" if len(stripped) > 80 else "")
+    return "(pass only)"
 
     def _filter_tools(self, expect: str | None) -> list[dict]:
         """
@@ -370,6 +440,10 @@ class StepAgent:
         tools:    list[dict],
         emit:     EventCallback,
     ) -> dict | None:
+        # Compress message history before sending — prevents context bloat
+        # when implement_context accumulates many pieces across steps.
+        messages = self.compressor.compress_messages(messages)
+
         if not self.stream_tokens:
             try:
                 return await asyncio.to_thread(

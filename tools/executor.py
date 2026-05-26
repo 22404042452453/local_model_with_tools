@@ -68,6 +68,38 @@ def make_executor(workspace: Path, plugin_registry=None):
                 f"  {f.relative_to(workspace)}  ({f.stat().st_size}B)" for f in files
             ), False
 
+        elif name == "edit_file":
+            rel  = args["path"].lstrip("/\\")
+            path = _safe(rel, workspace)
+            if path is None: return "Error: path escapes workspace.", False
+            try:
+                content = path.read_text(encoding="utf-8")
+                find    = args["find"]
+                replace = args["replace"]
+                if find not in content:
+                    return f"Error: string not found in {rel}. Make sure 'find' matches exactly.", False
+                count = content.count(find)
+                new_content = content.replace(find, replace, 1)
+                path.write_text(new_content, encoding="utf-8")
+                return f"Edited {rel}: replaced 1 of {count} occurrence(s) ({len(new_content)} chars total)", False
+            except FileNotFoundError:
+                return f"File not found: {rel}", False
+            except Exception as e:
+                return f"Edit error: {e}", False
+
+        elif name == "delete_file":
+            rel  = args["path"].lstrip("/\\")
+            path = _safe(rel, workspace)
+            if path is None: return "Error: path escapes workspace.", False
+            try:
+                if not path.exists():
+                    return f"File not found: {rel}", False
+                size = path.stat().st_size
+                path.unlink()
+                return f"Deleted {rel} ({size}B)", False
+            except Exception as e:
+                return f"Delete error: {e}", False
+
         elif name == "run_command":
             timeout = min(int(args.get("timeout", 60)), 180)
             try:

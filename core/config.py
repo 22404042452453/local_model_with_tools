@@ -68,10 +68,11 @@ class Config:
     reviewer_cfg:  AgentProviderConfig = field(default_factory=AgentProviderConfig)
 
     # ── Pipeline behaviour ────────────────────────────────────────────────────
-    max_steps:          int  = 25
-    max_iterations:     int  = 3
-    stream_tokens:      bool = True
-    use_step_pipeline:  bool = True   # use StepPipeline (atomic steps) for coding tasks
+    max_steps:             int  = 25
+    max_iterations:        int  = 3
+    stream_tokens:         bool = True
+    use_step_pipeline:     bool = True   # use StepPipeline (atomic steps) for coding tasks
+    parallel_impl_workers: int  = 3      # concurrent LLM calls for implement_steps (1=sequential)
 
     # ── Workspace ─────────────────────────────────────────────────────────────
     workspace: Path = field(default_factory=lambda: Path("./workspace"))
@@ -105,6 +106,7 @@ class Config:
             max_iterations     = int(os.getenv("AGENT_MAX_ITERATIONS", "3")),
             stream_tokens      = os.getenv("AGENT_STREAM_TOKENS", "true").lower() == "true",
             use_step_pipeline  = os.getenv("AGENT_STEP_PIPELINE", "true").lower() == "true",
+            parallel_impl_workers = int(os.getenv("AGENT_PARALLEL_WORKERS", "3")),
             workspace      = Path(os.getenv("AGENT_WORKSPACE", "./workspace")),
             host           = os.getenv("AGENT_HOST", "127.0.0.1"),
             port           = int(os.getenv("AGENT_PORT", "8000")),
@@ -129,7 +131,9 @@ def check_ollama_model(model: str, base_url: str = "http://localhost:11434") -> 
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read())
         models = [m["name"] for m in data.get("models", [])]
-        if model in models:
+        # Check exact match and without :latest tag
+        models_stripped = [m.rsplit(":", 1)[0] for m in models]
+        if model in models or model in models_stripped:
             return True, ""
         base_name = model.split(":")[0]
         matches = [m for m in models if m.startswith(base_name)]

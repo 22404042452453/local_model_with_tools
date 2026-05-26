@@ -115,9 +115,10 @@ def coder_steps(task: str, workspace: Path,
 
     # One write step per file from the plan
     if files_to_create:
-        for filepath in files_to_create:
+        for idx, filepath in enumerate(files_to_create, 1):
             desc = descs.get(filepath, "")
-            steps.append(_write_file_step(task, filepath, desc))
+            steps.append(_write_file_step(task, filepath, desc,
+                                           file_num=idx, total_files=len(files_to_create)))
     else:
         # Fallback: single generic write step
         steps.append(Step(
@@ -145,24 +146,175 @@ def coder_steps(task: str, workspace: Path,
     return steps
 
 
-def _write_file_step(task: str, filepath: str, description: str = "") -> Step:
+def _write_file_step(task: str, filepath: str, description: str = "",
+                     file_num: int = 0, total_files: int = 0) -> Step:
     """Create a step for writing one specific file with its description."""
     desc_block = f"\nThis file should contain: {description}\n" if description else ""
+    num_label = f"[File {file_num}/{total_files}] " if file_num else ""
     return Step(
         prompt=(
-            f"Task: {task}\n\n"
-            f"Write file: {filepath}\n"
+            f"{num_label}Write file: {filepath}\n"
+            f"Task: {task}\n"
             f"{desc_block}"
-            f"Write COMPLETE, working code. No stubs, no TODO, no placeholder comments.\n"
-            f"Call write_file(path=\"{filepath}\", content=\"...\") NOW.\n"
-            f"DO NOT call read_file or list_files. Just write the code."
+            f"Write COMPLETE, working code. No stubs, no TODO.\n"
+            f"Call write_file(path=\"{filepath}\", content=\"...\") NOW."
         ),
         expect="write_file",
-        required=False,   # don't abort all if one file fails
-        max_retries=2,
+        required=False,
+        max_retries=1,   # one self-retry max; pipeline-level loop handles deeper fixes
         validate=_validate_file_written,
         on_result=lambda r, ctx: ctx.update({"_current_file": filepath}),
     )
+
+
+# ── Spec-First: Skeleton + Implement steps ────────────────────────────────────
+
+def skeleton_step(task: str, filepath: str, description: str = "",
+                  file_num: int = 0, total_files: int = 0) -> Step:
+    """
+    Phase 1 of Spec-First writing.
+
+    Ask the model to write ONLY the skeleton of the file:
+        - Module docstring
+        - Imports
+        - Class definitions (no body, just pass/docstring)
+        - Function signatures + docstrings + pass body
+
+    ~20-30 lines. Small models write this perfectly.
+    Pipeline then parses the skeleton with AST to extract FunctionSpecs.
+    """
+    num_label = f"[File {file_num}/{total_files}] " if file_num else ""
+    skeleton_path = f"_skeleton_{filepath.replace('/', '_')}"
+    return Step(
+        prompt=(
+            f"{num_label}Write SKELETON ONLY for: {filepath}\n"
+            f"Task: {task}\n"
+            + (f"Purpose: {description}\n" if description else "") +
+            "\nWrite ONLY:\n"
+            "  1. Module docstring (triple quotes)\n"
+            "  2. All import statements\n"
+            "  3. All class definitions with class docstring and method signatures\n"
+            "  4. All top-level function signatures with docstring\n"
+            "  5. Every function/method body = just `pass` (no implementation)\n\n"
+            "NO real implementation yet — only structure.\n"
+            f"Call write_file(path=\"{skeleton_path}\", content=\"\"\"\n"
+            "'''Module docstring'''\nimport ...\n\nclass Foo:\n    def bar(self): pass\n\n"
+            "def baz(): pass\n\"\"\") NOW."
+        ),
+        expect="write_file",
+        required=True,
+        max_retries=2,
+        validate=_validate_skeleton,
+        on_result=lambda r, ctx: ctx.update({
+            "_skeleton_path": skeleton_path,
+            "_skeleton_target": filepath,
+        }),
+    )
+
+
+def implement_steps(
+    task: str,
+    filepath: str,
+    specs: "list",           # list[FunctionSpec] from parse_skeleton
+    skeleton_code: str,
+    file_num: int = 0,
+    total_files: int = 0,
+) -> list[Step]:
+    """
+    Phase 2 of Spec-First writing.
+
+    For each FunctionSpec parsed from the skeleton, generates one Step.
+    Each step receives:
+      - The skeleton as structural context
+      - A dynamic "already written" list (populated at runtime via context)
+      - The specific function to implement
+
+    Cross-step consistency: on_result stores the signature hint so later
+    steps know what variables/patterns earlier functions used.
+    """
+    num_label = f"[File {file_num}/{total_files}] " if file_num else ""
+    steps: list[Step] = []
+
+    skeleton_ctx = skeleton_code[:1200] + ("\n..." if len(skeleton_code) > 1200 else "")
+
+    for i, spec in enumerate(specs):
+        if spec.is_class:
+            continue
+
+        method_prefix = f"{spec.class_name}." if spec.class_name else ""
+        full_name     = f"{method_prefix}{spec.name}"
+        piece_path    = f"_piece_{filepath.replace('/', '_')}_{spec.name}.py"
+
+        docstring_hint = f"\n  Docstring: {spec.docstring}" if spec.docstring else ""
+        class_hint     = (
+            f"\n  This is a method of class {spec.class_name}."
+            if spec.class_name else ""
+        )
+
+        # Build "already written" note dynamically — injected at prompt-build time
+        # via _build_prompt Cross-Step Context. But also embed a static placeholder
+        # so the model always sees it even without context injection.
+        already_written_note = (
+            f"\nOther functions in this file (use consistent variable names): "
+            f"{', '.join(s.name for s in specs if not s.is_class and s.name != spec.name)}"
+            if len(specs) > 2 else ""
+        )
+
+        steps.append(Step(
+            prompt=(
+                f"{num_label}Implement: {full_name}\n"
+                f"File: {filepath} | Task: {task}\n"
+                f"Signature: {spec.signature}{docstring_hint}{class_hint}"
+                f"{already_written_note}\n\n"
+                f"Skeleton (for structure reference only — do NOT copy pass stubs):\n"
+                f"```python\n{skeleton_ctx}\n```\n\n"
+                f"Write ONLY the complete `{spec.name}` function "
+                f"(def line + docstring + full working body, no pass).\n"
+                f"Call write_file(path=\"{piece_path}\", content=\"def {spec.name}...\")"
+            ),
+            expect="write_file",
+            required=False,
+            max_retries=2,
+            validate=_validate_nonempty,
+            on_result=lambda r, ctx, ppath=piece_path, fname=full_name, idx=i: (
+                ctx.setdefault("_pieces", []).append({
+                    "kind":  "function" if "." not in fname else "method",
+                    "name":  fname.split(".")[-1],
+                    "class": fname.split(".")[0] if "." in fname else "",
+                    "code":  _read_piece_from_result(r, ctx, ppath),
+                    "order": idx,
+                })
+            ),
+        ))
+
+    return steps
+
+
+def _read_piece_from_result(result: str, ctx: dict, piece_path: str) -> str:
+    """Read the written piece file from disk."""
+    from pathlib import Path
+    workspace = ctx.get("_workspace", "")
+    if workspace:
+        try:
+            full = Path(workspace) / piece_path.lstrip("/\\")
+            if full.exists():
+                return full.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return ""
+
+
+# ── Skeleton validator ────────────────────────────────────────────────────────
+
+def _validate_skeleton(result: str) -> tuple[bool, str]:
+    """
+    Check that write_file succeeded AND the skeleton looks like a Python structure.
+    """
+    if result.startswith("Written"):
+        return True, ""
+    if "error" in result.lower():
+        return False, f"Write failed: {result[:100]}"
+    return True, ""
 
 
 # ── Tester steps ──────────────────────────────────────────────────────────────

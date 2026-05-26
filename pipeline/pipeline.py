@@ -353,86 +353,197 @@ def _auto_generate_tests(workspace: Path) -> None:
 
 def _auto_review_code(workspace: Path) -> str:
     """
-    Auto-generate a basic code review when the model fails.
-    Checks: syntax errors, missing imports, common issues.
+    Thorough auto-review when the model fails to review.
+    Checks: syntax, imports, undefined vars, runtime errors, common issues.
     """
     import ast
+    import subprocess
 
     py_files = [f for f in workspace.rglob("*.py")
-                if "test_" not in f.name and f.name != "__init__.py"]
+                if "test_" not in f.name and f.name != "__init__.py"
+                and ".pytest_cache" not in str(f)]
 
     lines = ["# Auto-Generated Code Review\n"]
-    critical_found = False
+    all_issues: list[str] = []
 
     for py_file in py_files:
         rel = py_file.relative_to(workspace)
-        lines.append(f"\n## {rel}\n")
+        file_issues: list[str] = []
 
         try:
             source = py_file.read_text(encoding="utf-8")
         except Exception as e:
-            lines.append(f"- CRITICAL: Cannot read file: {e}")
-            critical_found = True
+            file_issues.append(f"CRITICAL: Cannot read file: {e}")
+            all_issues.extend(file_issues)
+            lines.append(f"\n## {rel}\n" + "\n".join(f"- {i}" for i in file_issues))
             continue
 
-        # Syntax check
+        # ── 1. Syntax check ───────────────────────────────────────────────────
         try:
             tree = ast.parse(source)
         except SyntaxError as e:
-            lines.append(f"- CRITICAL: Syntax error at line {e.lineno}: {e.msg}")
-            critical_found = True
+            file_issues.append(f"CRITICAL: Syntax error at line {e.lineno}: {e.msg}")
+            # Show the offending line
+            src_lines = source.splitlines()
+            if e.lineno and e.lineno <= len(src_lines):
+                file_issues.append(f"  Line {e.lineno}: {src_lines[e.lineno-1].rstrip()}")
+            all_issues.extend(file_issues)
+            lines.append(f"\n## {rel}\n" + "\n".join(f"- {i}" for i in file_issues))
             continue
 
-        lines.append(f"- Syntax: OK ({len(source)} chars, {len(source.splitlines())} lines)")
-
-        # Check for common issues
-        issues = []
-
-        # Undefined names (basic check)
-        names_used = set()
-        names_defined = set()
+        # ── 2. Import check ───────────────────────────────────────────────────
         for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                names_used.add(node.id)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                names_defined.add(node.name)
-            if isinstance(node, ast.ClassDef):
-                names_defined.add(node.name)
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    names_defined.add(alias.asname or alias.name.split(".")[0])
-            if isinstance(node, ast.ImportFrom):
+                    mod = alias.name.split(".")[0]
+                    ok, err = _check_import(mod)
+                    if not ok:
+                        file_issues.append(
+                            f"CRITICAL: Import '{alias.name}' failed: {err}. "
+                            f"Fix: remove import or install package."
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    mod = node.module.split(".")[0]
+                    # Skip relative imports (local modules)
+                    if node.level == 0:
+                        ok, err = _check_import(mod)
+                        if not ok:
+                            # Check if it's a local file
+                            local = workspace / (mod + ".py")
+                            if not local.exists():
+                                file_issues.append(
+                                    f"CRITICAL: Import 'from {node.module}' failed: {err}. "
+                                    f"Not a local file either."
+                                )
+
+        # ── 3. Undefined name detection (basic) ──────────────────────────────
+        defined = set()
+        used_names = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defined.add(node.name)
+                for arg in node.args.args:
+                    defined.add(arg.arg)
+            elif isinstance(node, ast.ClassDef):
+                defined.add(node.name)
+            elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    names_defined.add(alias.asname or alias.name)
+                    defined.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    if isinstance(target, ast.Name):
+                        defined.add(target.id)
+            elif isinstance(node, ast.For):
+                if isinstance(node.target, ast.Name):
+                    defined.add(node.target.id)
+            elif isinstance(node, ast.comprehension):
+                if isinstance(node.target, ast.Name):
+                    defined.add(node.target.id)
 
-        # Check for BaseModel usage without import
-        if "BaseModel" in names_used and "BaseModel" not in names_defined:
-            issues.append("CRITICAL: `BaseModel` used but not imported (add `from pydantic import BaseModel`)")
-            critical_found = True
+        # Common builtins that are always defined
+        builtins = {"print", "len", "range", "int", "str", "float", "list", "dict",
+                    "set", "tuple", "bool", "type", "None", "True", "False",
+                    "open", "super", "self", "cls", "enumerate", "zip", "map",
+                    "filter", "sorted", "reversed", "isinstance", "hasattr",
+                    "getattr", "setattr", "Exception", "ValueError", "TypeError",
+                    "KeyError", "IndexError", "FileNotFoundError", "RuntimeError",
+                    "StopIteration", "NotImplementedError", "OSError", "IOError",
+                    "property", "staticmethod", "classmethod", "abs", "min", "max",
+                    "sum", "round", "any", "all", "input", "format", "repr", "id",
+                    "hex", "oct", "bin", "chr", "ord", "bytes", "bytearray",
+                    "memoryview", "frozenset", "complex", "divmod", "pow",
+                    "hash", "callable", "dir", "vars", "globals", "locals",
+                    "__name__", "__file__", "__all__"}
 
-        if "Field" in names_used and "Field" not in names_defined:
-            issues.append("CRITICAL: `Field` used but not imported (add `from pydantic import Field`)")
-            critical_found = True
+        # Check for BaseModel/Field without import (very common error)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "BaseModel" and "BaseModel" not in defined:
+                file_issues.append(
+                    "CRITICAL: `BaseModel` used but not imported. "
+                    "Add: `from pydantic import BaseModel`"
+                )
+            if isinstance(node, ast.Name) and node.id == "Field" and "Field" not in defined:
+                file_issues.append(
+                    "CRITICAL: `Field` used but not imported. "
+                    "Add: `from pydantic import Field`"
+                )
 
-        # Check for bare except
+        # ── 4. Try/except without handler ─────────────────────────────────────
         for node in ast.walk(tree):
             if isinstance(node, ast.ExceptHandler) and node.type is None:
-                issues.append("MAJOR: Bare `except:` clause — catch specific exceptions")
+                file_issues.append("MAJOR: Bare `except:` clause — catch specific exceptions")
+            if isinstance(node, ast.Try):
+                if not node.handlers and not node.finalbody:
+                    file_issues.append("CRITICAL: `try` without `except` or `finally`")
 
-        # Check for TODO/FIXME
+        # ── 5. Runtime check — try to compile and run basic import ────────────
+        try:
+            result = subprocess.run(
+                ["python", "-c", f"import ast; ast.parse(open(r'{py_file}').read()); print('syntax_ok')"],
+                cwd=workspace, capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                err = result.stderr.strip().split("\n")[-1] if result.stderr else "unknown"
+                file_issues.append(f"CRITICAL: Runtime check failed: {err}")
+        except Exception:
+            pass
+
+        # ── 6. TODO/FIXME ─────────────────────────────────────────────────────
         for i, line in enumerate(source.splitlines(), 1):
             if "TODO" in line or "FIXME" in line:
-                issues.append(f"MINOR: TODO/FIXME at line {i}: {line.strip()[:60]}")
+                file_issues.append(f"MINOR: TODO/FIXME at line {i}: {line.strip()[:60]}")
+            if "pass" == line.strip() and i > 1:
+                # Check if it's a stub function
+                prev = source.splitlines()[i-2].strip() if i >= 2 else ""
+                if prev.startswith("def ") or prev.startswith("class "):
+                    file_issues.append(f"MAJOR: Stub function at line {i-1}: {prev[:60]}")
 
-        if issues:
-            for issue in issues:
+        # ── Summary for this file ─────────────────────────────────────────────
+        lines.append(f"\n## {rel}")
+        lines.append(f"- Lines: {len(source.splitlines())}, Size: {len(source)} chars")
+        if file_issues:
+            for issue in file_issues:
                 lines.append(f"- {issue}")
         else:
             lines.append("- No issues found")
 
-    if critical_found:
-        lines.insert(1, "\n**VERDICT: FAIL** — Critical issues found\n")
-    else:
-        lines.insert(1, "\n**VERDICT: PASS** — No critical issues\n")
+        all_issues.extend(file_issues)
 
+    # ── Overall verdict ───────────────────────────────────────────────────────
+    critical = [i for i in all_issues if "CRITICAL" in i]
+    major    = [i for i in all_issues if "MAJOR" in i]
+    minor    = [i for i in all_issues if "MINOR" in i]
+
+    verdict = "FAIL" if critical else "PASS"
+    summary = (
+        f"\n---\n"
+        f"**VERDICT: {verdict}**\n"
+        f"- Critical: {len(critical)}\n"
+        f"- Major: {len(major)}\n"
+        f"- Minor: {len(minor)}\n"
+    )
+
+    if critical:
+        summary += "\n**Fix these CRITICAL issues:**\n"
+        for i, issue in enumerate(critical[:5], 1):
+            summary += f"{i}. {issue}\n"
+
+    lines.insert(1, summary)
     return "\n".join(lines)
+
+
+def _check_import(module_name: str) -> tuple[bool, str]:
+    """Check if a Python module can be imported."""
+    import importlib
+    try:
+        importlib.import_module(module_name)
+        return True, ""
+    except ImportError as e:
+        return False, str(e)
+    except Exception as e:
+        return True, ""  # non-import error = module exists but has issues
