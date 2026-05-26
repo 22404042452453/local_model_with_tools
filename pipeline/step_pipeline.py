@@ -63,10 +63,14 @@ class StepPipeline:
         def _provider(name: str):
             return make_provider(**cfg.provider_kwargs(name))
 
-        def _no_think_system(system: str) -> str:
-            """Prepend /no_think for qwen3 models to disable reasoning."""
+        def _no_think_system(agent_name: str, system: str) -> str:
+            """Prepend /no_think for qwen3 models — only for coder and tester."""
             model = cfg.model.lower()
-            if any(x in model for x in ("qwen3", "qwen2.5", "qwen3.5")):
+            is_qwen = any(x in model for x in ("qwen3", "qwen2.5", "qwen3.5"))
+            # Reasoning ON for architect and reviewer (need deep thinking)
+            # Reasoning OFF for coder and tester (need fast tool calls)
+            needs_no_think = agent_name in ("coder", "tester")
+            if is_qwen and needs_no_think:
                 return "/no_think\n\n" + system
             return system
 
@@ -76,7 +80,7 @@ class StepPipeline:
                 provider      = _provider(agent_name),
                 tools         = tools,
                 executor      = executor,
-                system        = _no_think_system(system),
+                system        = _no_think_system(agent_name, system),
                 stream_tokens = cfg.stream_tokens,
             )
 
@@ -113,6 +117,15 @@ class StepPipeline:
         result.architect_summary = plan_path.read_text(encoding="utf-8")[:200]
         await self._emit(Event.done("architect", result.architect_summary))
 
+        # Parse file list from plan.md
+        plan_content = plan_path.read_text(encoding="utf-8")
+        planned_files = _extract_files_from_plan(plan_content)
+        if planned_files:
+            await self._emit(Event("pipeline", "agent_start", {
+                "task": f"Plan specifies {len(planned_files)} files: {', '.join(planned_files[:5])}",
+                "stage": "plan_parsed",
+            }))
+
         # ── 2. Coder → Tester → Reviewer loop ─────────────────────────────────
         previous_issues = ""
 
@@ -133,9 +146,12 @@ class StepPipeline:
                 )
             )
             coder_agent  = _step_agent("coder", CODER_TOOLS, coder_system)
-            coder_context: dict = {"_memory": {}}
+            coder_context: dict = {"_memory": {}, "_workspace": str(cfg.workspace)}
 
-            coder_step_list = coder_steps(task, cfg.workspace)
+            # Dynamic steps: one write_file per planned file
+            coder_step_list = coder_steps(task, cfg.workspace,
+                                           files_to_create=planned_files or None,
+                                           file_descriptions=file_descriptions or {})
             await coder_agent.run_steps(coder_step_list, coder_context, self._emit)
 
             # Verify at least one .py file was created
@@ -236,3 +252,93 @@ class StepPipeline:
             return "FAIL", "Tests timed out after 60s"
         except Exception as e:
             return "FAIL", f"Test run error: {e}"
+
+
+# ── Plan parser ───────────────────────────────────────────────────────────────
+
+def _extract_files_from_plan(plan_text: str) -> list[str]:
+    """
+    Extract filenames from plan.md.
+    """
+    import re
+
+    files = []
+    seen  = set()
+
+    # Pattern 1: tree-style  ├── filename.py  or  └── filename.py
+    for m in re.finditer(r'[├└│─\s]+\s*([\w/\-\.]+\.(?:py|html|css|js|json|txt|yaml|yml|j2|jinja2|toml))\b', plan_text):
+        f = m.group(1).strip()
+        if f not in seen:
+            files.append(f)
+            seen.add(f)
+
+    # Pattern 2: backtick  `filename.py`
+    for m in re.finditer(r'`([\w/\-\.]+\.(?:py|html|j2))`', plan_text):
+        f = m.group(1).strip()
+        if f not in seen:
+            files.append(f)
+            seen.add(f)
+
+    # Pattern 3: bold  **filename.py**
+    for m in re.finditer(r'\*\*([\w/\-\.]+\.(?:py|html|j2))\*\*', plan_text):
+        f = m.group(1).strip()
+        if f not in seen:
+            files.append(f)
+            seen.add(f)
+
+    # Filter out non-code files
+    skip = {"requirements.txt", "__init__.py", ".gitignore", "README.md"}
+    files = [f for f in files if f not in skip]
+
+    # Sort: config first, then modules, main.py last
+    def sort_key(f):
+        name = f.split("/")[-1]
+        if "config" in name: return 0
+        if name == "main.py": return 99
+        return 1
+
+    files.sort(key=sort_key)
+    return files
+
+
+def _extract_file_descriptions(plan_text: str, files: list[str]) -> dict[str, str]:
+    """
+    Extract description/purpose for each file from plan.md.
+    Looks for patterns like:
+        ├── main.py    # Точка входа + CLI интерфейс
+        ### `galaxy_generator.py`
+        - Класс Star: ...
+    Returns {filename: description}
+    """
+    import re
+    descriptions: dict[str, str] = {}
+
+    for filename in files:
+        basename = filename.split("/")[-1]
+        desc_parts = []
+
+        # Pattern 1: tree comment  "├── main.py  # comment"
+        pattern1 = re.escape(basename) + r'\s*#\s*(.+)'
+        for m in re.finditer(pattern1, plan_text):
+            desc_parts.append(m.group(1).strip())
+
+        # Pattern 2: header section  "### `filename.py`" followed by lines
+        escaped = re.escape(basename)
+        pattern2 = rf'###?\s*[`\*]*{escaped}[`\*]*\s*\n((?:[-\s*].*\n)*)'
+        for m in re.finditer(pattern2, plan_text):
+            section = m.group(1).strip()
+            # Take first 3 lines
+            lines = [l.strip("- *") for l in section.splitlines() if l.strip()][:3]
+            desc_parts.extend(lines)
+
+        # Pattern 3: "**Шаг N**: Создать `filename` - description"
+        pattern3 = rf'[Шш]аг\s*\d+[:\s]*.*?{escaped}.*?[-–]\s*(.+)'
+        for m in re.finditer(pattern3, plan_text):
+            desc_parts.append(m.group(1).strip())
+
+        if desc_parts:
+            descriptions[filename] = " | ".join(desc_parts[:3])
+        else:
+            descriptions[filename] = f"Implementation file for the project"
+
+    return descriptions

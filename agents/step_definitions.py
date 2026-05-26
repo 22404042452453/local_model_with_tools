@@ -88,13 +88,17 @@ def architect_steps(task: str, workspace: Path, search_first: bool = True) -> li
 
 # ── Coder steps ───────────────────────────────────────────────────────────────
 
-def coder_steps(task: str, workspace: Path, files_to_create: list[str] | None = None) -> list[Step]:
+def coder_steps(task: str, workspace: Path,
+                files_to_create: list[str] | None = None,
+                file_descriptions: dict[str, str] | None = None) -> list[Step]:
     """
-    Dynamic steps: read plan → for each file → write it → verify syntax.
-    If files_to_create is None, it's populated after reading plan.md.
+    Dynamic steps: read plan → for each file → write it → verify.
+    Each file gets its own step with description from plan.
     """
+    descs = file_descriptions or {}
+
     steps = [
-        # Step 1: Read plan.md
+        # Step 1: Read plan.md (forced — always works)
         Step(
             prompt=(
                 f"Task: {task}\n\n"
@@ -107,30 +111,20 @@ def coder_steps(task: str, workspace: Path, files_to_create: list[str] | None = 
             validate=_validate_nonempty,
             on_result=lambda r, ctx: ctx.update({"plan_content": r}),
         ),
-        # Step 2: List existing files (to know current state)
-        Step(
-            prompt="List all files in the workspace to see what already exists.",
-            expect="list_files",
-            args={},
-            required=False,
-            max_retries=1,
-            on_result=lambda r, ctx: ctx.update({"existing_files": r}),
-        ),
     ]
 
-    # If we know which files to create upfront, add write steps
+    # One write step per file from the plan
     if files_to_create:
         for filepath in files_to_create:
-            steps.append(_write_file_step(task, filepath))
+            desc = descs.get(filepath, "")
+            steps.append(_write_file_step(task, filepath, desc))
     else:
-        # Add a dynamic "figure out what to write" step
-        # This is procedural — handled in make_step_coder()
+        # Fallback: single generic write step
         steps.append(Step(
             prompt=(
                 f"Task: {task}\n\n"
-                "You have read plan.md. Now write the main Python file.\n"
+                "Write the main implementation file.\n"
                 "Call write_file(path=\"main.py\", content=\"...\") with COMPLETE working code.\n"
-                "No placeholders, no TODO, no pass. Write the full implementation.\n"
                 "DO NOT read files again. Call write_file NOW."
             ),
             expect="write_file",
@@ -139,7 +133,7 @@ def coder_steps(task: str, workspace: Path, files_to_create: list[str] | None = 
             validate=_validate_file_written,
         ))
 
-    # Final: verify files exist
+    # Final: verify
     steps.append(Step(
         prompt="List all files in workspace to confirm they were created.",
         expect="list_files",
@@ -151,19 +145,23 @@ def coder_steps(task: str, workspace: Path, files_to_create: list[str] | None = 
     return steps
 
 
-def _write_file_step(task: str, filepath: str) -> Step:
-    """Create a step for writing one specific file."""
+def _write_file_step(task: str, filepath: str, description: str = "") -> Step:
+    """Create a step for writing one specific file with its description."""
+    desc_block = f"\nThis file should contain: {description}\n" if description else ""
     return Step(
         prompt=(
             f"Task: {task}\n\n"
-            f"Write the file: {filepath}\n"
-            f"Write complete, production-quality code. No stubs, no TODOs.\n"
-            f"Use write_file(path=\"{filepath}\", content=\"...\") now."
+            f"Write file: {filepath}\n"
+            f"{desc_block}"
+            f"Write COMPLETE, working code. No stubs, no TODO, no placeholder comments.\n"
+            f"Call write_file(path=\"{filepath}\", content=\"...\") NOW.\n"
+            f"DO NOT call read_file or list_files. Just write the code."
         ),
         expect="write_file",
-        required=True,
-        max_retries=3,
+        required=False,   # don't abort all if one file fails
+        max_retries=2,
         validate=_validate_file_written,
+        on_result=lambda r, ctx: ctx.update({"_current_file": filepath}),
     )
 
 
