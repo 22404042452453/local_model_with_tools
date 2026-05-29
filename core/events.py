@@ -12,6 +12,8 @@ EventType = Literal[
     "thought",        # completed text block
     "tool_call",      # agent calls a tool
     "tool_result",    # tool result returned
+    "step_done",      # one step completed (timing, tokens, tool used)
+    "file_changed",   # file written/edited — UI can show diff
     "agent_done",     # agent finished (includes verdict for tester/reviewer)
     "iteration",      # pipeline starting next loop (n, reason)
     "pipeline_done",  # all done
@@ -41,6 +43,21 @@ class Event:
     def tool_call(agent: AgentName, tool: str, args: dict)    -> "Event": return Event(agent, "tool_call",    {"tool": tool, "args": args})
     @staticmethod
     def tool_result(agent: AgentName, tool: str, result: str) -> "Event": return Event(agent, "tool_result",  {"tool": tool, "result": result})
+    @staticmethod
+    def step_done(agent: AgentName, step_idx: int, tool: str,
+                  elapsed_sec: float, tokens: int = 0, ok: bool = True) -> "Event":
+        return Event(agent, "step_done", {
+            "step": step_idx, "tool": tool,
+            "elapsed_sec": round(elapsed_sec, 2),
+            "tokens": tokens, "ok": ok,
+        })
+    @staticmethod
+    def file_changed(agent: AgentName, path: str, action: str = "write",
+                     size: int = 0, preview: str = "") -> "Event":
+        return Event(agent, "file_changed", {
+            "path": path, "action": action,
+            "size": size, "preview": preview[:300],
+        })
     @staticmethod
     def done(agent: AgentName, output: str, verdict: str = "PASS") -> "Event":
         return Event(agent, "agent_done", {"output": output, "verdict": verdict})

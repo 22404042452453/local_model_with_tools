@@ -125,14 +125,30 @@ class StepAgent:
     ) -> tuple[bool, dict]:
         """
         Execute steps in sequence.
-        Emits progress events so UI shows what's happening.
+        Builds a progress tracker so each step knows what's done and what's ahead.
         """
         total = len(steps)
+
+        # ── Build progress list: short description per step ───────────────────
+        progress: list[dict] = []
+        for idx, s in enumerate(steps):
+            short = s.prompt.split("\n")[0][:60]
+            if s.expect:
+                short = f"{s.expect}: {short}"
+            progress.append({
+                "idx":    idx + 1,
+                "desc":   short,
+                "status": "pending",   # pending → running → done / failed
+                "result": "",          # brief outcome after completion
+            })
+        context["_progress"] = progress
+        context["_progress_total"] = total
+
         for i, step in enumerate(steps):
-            # Emit progress: "Step 2/8: Write file: main.py"
-            short_desc = step.prompt.split("\n")[0][:80]
-            if step.expect:
-                short_desc = f"{step.expect}  →  {short_desc}"
+            # Mark current step as running
+            progress[i]["status"] = "running"
+
+            short_desc = progress[i]["desc"]
             await emit(Event(self.name, "agent_start", {
                 "task": f"Step {i+1}/{total}: {short_desc}",
                 "stage": "step_progress",
@@ -141,11 +157,42 @@ class StepAgent:
             }))
 
             ok = await self._run_step(step, i, context, emit)
+
+            # Update progress with outcome
+            if ok:
+                progress[i]["status"] = "done"
+                # Capture brief result from context if available
+                result_hint = self._get_step_result_hint(step, context)
+                progress[i]["result"] = result_hint
+            else:
+                progress[i]["status"] = "failed"
+                progress[i]["result"] = "FAILED"
+
             if not ok and step.required:
                 await emit(Event.error(self.name,
                     f"Required step {i+1}/{total} failed: {short_desc}"))
                 return False, context
+
         return True, context
+
+    @staticmethod
+    def _get_step_result_hint(step: Step, context: dict) -> str:
+        """Extract a brief result description from the step's outcome."""
+        if step.expect == "read_file":
+            # How many chars were read
+            for key in ("plan_content", "source_code"):
+                if key in context:
+                    val = context[key]
+                    return f"{len(val)} chars" if isinstance(val, str) else "OK"
+            return "OK"
+        if step.expect == "write_file":
+            current = context.get("_current_file", "")
+            return f"→ {current}" if current else "written"
+        if step.expect == "web_search":
+            return "searched"
+        if step.expect == "run_command":
+            return "executed"
+        return "OK"
 
     async def _run_step(
         self,
@@ -155,6 +202,7 @@ class StepAgent:
         emit:    EventCallback,
     ) -> bool:
         """Run one step with retries. Returns True on success."""
+        import time as _time
 
         for attempt in range(step.max_retries + 1):
             if attempt > 0:
@@ -163,9 +211,15 @@ class StepAgent:
                     "text": f"Retry {attempt}/{step.max_retries}: {short}",
                 }))
 
+            t0 = _time.perf_counter()
             result, tool_name = await self._call_step(step, context, emit, attempt)
+            elapsed = _time.perf_counter() - t0
 
             if result is None:
+                await emit(Event.step_done(
+                    self.name, index, step.expect or "?",
+                    elapsed_sec=elapsed, ok=False,
+                ))
                 continue  # provider error → retry
 
             # Validate result
@@ -173,9 +227,29 @@ class StepAgent:
                 ok, error = step.validate(result)
                 if not ok:
                     await emit(Event.error(self.name, f"Step {index+1} validation: {error}"))
-                    # Put error in context for next retry
                     context[f"_step_{index}_error"] = error
+                    await emit(Event.step_done(
+                        self.name, index, tool_name or step.expect or "?",
+                        elapsed_sec=elapsed, ok=False,
+                    ))
                     continue
+
+            # ── Emit step_done with timing ────────────────────────────────────
+            await emit(Event.step_done(
+                self.name, index, tool_name or step.expect or "?",
+                elapsed_sec=elapsed, ok=True,
+            ))
+
+            # ── Emit file_changed for write_file / edit_file ──────────────────
+            if tool_name in ("write_file", "edit_file"):
+                filepath = self._extract_filepath_from_result(result, step, context)
+                size = len(result.encode("utf-8")) if result else 0
+                preview = result[:300] if result else ""
+                action = "write" if tool_name == "write_file" else "edit"
+                await emit(Event.file_changed(
+                    self.name, filepath, action=action,
+                    size=size, preview=preview,
+                ))
 
             # Store result via callback
             if step.on_result:
@@ -184,6 +258,14 @@ class StepAgent:
             return True
 
         return False
+
+    def _extract_filepath_from_result(self, result: str, step: Step, context: dict) -> str:
+        """Extract filepath from write_file result or context."""
+        # Result usually starts with "Written 1234 chars -> main.py"
+        if "->" in result:
+            return result.split("->")[-1].strip()
+        # Fallback to context
+        return context.get("_current_file", step.expect or "unknown")
 
     async def _call_step(
         self,
@@ -293,7 +375,37 @@ class StepAgent:
     def _build_prompt(self, step: Step, context: dict, attempt: int) -> str:
         """Build a focused prompt for this step."""
         prefix = self._no_think_prefix()
-        lines = [prefix + step.prompt]
+        lines = [prefix]
+
+        # ── Progress tracker: what's done, current, remaining ─────────────────
+        progress = context.get("_progress", [])
+        if progress and len(progress) > 1:
+            total = context.get("_progress_total", len(progress))
+            current_idx = None
+            for p in progress:
+                if p["status"] == "running":
+                    current_idx = p["idx"]
+                    break
+
+            if current_idx is not None:
+                prog_lines = [f"── PROGRESS {current_idx}/{total} ──"]
+                for p in progress:
+                    idx = p["idx"]
+                    desc = p["desc"][:50]
+                    if p["status"] == "done":
+                        hint = f" ({p['result']})" if p["result"] else ""
+                        prog_lines.append(f"  ✅ {idx}. {desc}{hint}")
+                    elif p["status"] == "running":
+                        prog_lines.append(f"  ▸  {idx}. {desc}  ← YOU ARE HERE")
+                    elif p["status"] == "failed":
+                        prog_lines.append(f"  ❌ {idx}. {desc} (FAILED)")
+                    else:
+                        prog_lines.append(f"  ○  {idx}. {desc}")
+                prog_lines.append("────────────────────────")
+                lines.append("\n".join(prog_lines))
+
+        # ── Step prompt ───────────────────────────────────────────────────────
+        lines.append(step.prompt)
 
         # ── Fix 1: Cross-Step Context ─────────────────────────────────────────
         # inject already-written functions so implement steps are consistent.
@@ -368,17 +480,6 @@ class StepAgent:
                 )
 
         return "\n".join(lines)
-
-
-def _extract_signature_hint(code: str) -> str:
-    """Pull the first meaningful line from a piece of code as a hint."""
-    if not code:
-        return "(empty)"
-    for line in code.splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and stripped != "pass":
-            return stripped[:80] + ("…" if len(stripped) > 80 else "")
-    return "(pass only)"
 
     def _filter_tools(self, expect: str | None) -> list[dict]:
         """
@@ -476,3 +577,16 @@ def _extract_signature_hint(code: str) -> str:
             else:
                 await emit(Event.error(self.name, payload))
                 return None
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _extract_signature_hint(code: str) -> str:
+    """Pull the first meaningful line from a piece of code as a hint."""
+    if not code:
+        return "(empty)"
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and stripped != "pass":
+            return stripped[:80] + ("…" if len(stripped) > 80 else "")
+    return "(pass only)"

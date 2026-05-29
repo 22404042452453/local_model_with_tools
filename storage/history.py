@@ -253,6 +253,29 @@ class History:
                     pass
         return d
 
+    def cleanup_stale(self, max_age_hours: int = 0) -> int:
+        """
+        Mark 'running' records as 'crashed'.
+        Called on server startup — if server restarted, no runs are actually running.
+        max_age_hours=0 means clean ALL running records (default on startup).
+        """
+        import time
+        if max_age_hours > 0:
+            cutoff = time.time() - (max_age_hours * 3600)
+            cur = self.conn.execute(
+                "UPDATE runs SET status='crashed', verdict='FAIL' "
+                "WHERE status='running' AND started_at < ?",
+                (cutoff,),
+            )
+        else:
+            # Clean ALL running records — server just restarted, nothing is running
+            cur = self.conn.execute(
+                "UPDATE runs SET status='crashed', verdict='FAIL' "
+                "WHERE status='running'",
+            )
+        self.conn.commit()
+        return cur.rowcount
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()

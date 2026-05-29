@@ -64,16 +64,24 @@ class StepPipeline:
             await q.put(event)
 
     async def run(self, task: str, clean_workspace: bool = False) -> PipelineResult:
+        import time as _time
+        _t_pipeline_start = _time.perf_counter()
+        _timing: dict[str, float] = {}   # agent_name → elapsed_sec
+
         cfg = self.config
         if clean_workspace:
             _clean_dir(cfg.workspace)
         cfg.workspace.mkdir(parents=True, exist_ok=True)
 
-        executor = make_executor(cfg.workspace)
+        # ── Load plugins ──────────────────────────────────────────────────────
+        _plugin_registry = None
+        try:
+            from plugins.loader import get_registry
+            _plugin_registry = get_registry()
+        except Exception:
+            pass
 
-        # Store on self for use in _implement_file_parallel
-        self._executor = executor
-        self._cfg      = cfg
+        executor = make_executor(cfg.workspace, plugin_registry=_plugin_registry)
 
         # ── History: open run record ──────────────────────────────────────────
         _history = None
@@ -85,6 +93,49 @@ class StepPipeline:
         except Exception:
             pass  # history is optional — never block the pipeline
 
+        # Wrap ENTIRE pipeline in try/finally to guarantee finish_run is called.
+        # Without this, any exception leaves the run as "running" forever.
+        try:
+            result = await self._run_pipeline(task, cfg, executor, _timing, _plugin_registry)
+        except Exception as e:
+            result = PipelineResult(workspace=cfg.workspace)
+            result.final_verdict = "FAIL"
+            result.success = False
+            await self._emit(Event.error("pipeline", f"Pipeline crashed: {e}"))
+        finally:
+            # ── History: ALWAYS close run record ──────────────────────────────
+            if _history and _run_id:
+                try:
+                    _timing["total"] = round(_time.perf_counter() - _t_pipeline_start, 2)
+                    verdict = getattr(result, "final_verdict", "FAIL") or "FAIL"
+                    summary = {
+                        "iterations":    len(getattr(result, "iterations", [])),
+                        "final_verdict": verdict,
+                        "timing":        _timing,
+                    }
+                    _history.finish_run(_run_id, verdict, summary)
+                    if verdict == "PASS":
+                        _history.save_workspace_snapshot(_run_id, cfg.workspace)
+                except Exception:
+                    # Last resort: mark as failed so it doesn't stay "running"
+                    try:
+                        _history.fail_run(_run_id, "finish_run error")
+                    except Exception:
+                        pass
+
+        return result
+
+    async def _run_pipeline(
+        self, task: str, cfg: Config, executor, _timing: dict,
+        plugin_registry=None,
+    ) -> PipelineResult:
+        """Inner pipeline logic — extracted so run() can wrap it in try/finally."""
+        import time as _time
+
+        # Store on self for use in _implement_file_parallel
+        self._executor = executor
+        self._cfg      = cfg
+
         def _provider(name: str):
             return make_provider(**cfg.provider_kwargs(name))
 
@@ -95,18 +146,26 @@ class StepPipeline:
             """Prepend /no_think for qwen3 models — only for coder and tester."""
             model = cfg.model.lower()
             is_qwen = any(x in model for x in ("qwen3", "qwen2.5", "qwen3.5"))
-            # Reasoning ON for architect and reviewer (need deep thinking)
-            # Reasoning OFF for coder and tester (need fast tool calls)
             needs_no_think = agent_name in ("coder", "tester")
             if is_qwen and needs_no_think:
                 return "/no_think\n\n" + system
             return system
 
+        def _merge_plugin_tools(agent_name: str, base_tools: list) -> list:
+            """Add plugin tool definitions to agent's tool list."""
+            if not plugin_registry:
+                return base_tools
+            plugin_tools = plugin_registry.get_tools(agent_name)
+            if not plugin_tools:
+                return base_tools
+            return base_tools + plugin_tools
+
         def _step_agent(agent_name: str, tools, system: str) -> StepAgent:
+            merged_tools = _merge_plugin_tools(agent_name, tools)
             return StepAgent(
                 name          = agent_name,
                 provider      = _provider(agent_name),
-                tools         = tools,
+                tools         = merged_tools,
                 executor      = executor,
                 system        = _no_think_system(agent_name, system),
                 stream_tokens = cfg.stream_tokens,
@@ -143,20 +202,33 @@ class StepPipeline:
         await self._emit(Event.start("architect", task))
 
         steps = architect_steps(task, cfg.workspace, search_first=True)
+        _t0 = _time.perf_counter()
         ok, arch_context = await arch_agent.run_steps(steps, arch_context, self._emit)
+        _timing["architect"] = round(_time.perf_counter() - _t0, 2)
 
-        # Fallback: if plan.md not created, build from context
+        # Fallback: if plan.md not created, build structured plan from context
         plan_path = cfg.workspace / "plan.md"
         if not plan_path.exists():
-            combined = arch_context.get("_search_result", "") or task
-            plan_path.write_text(
-                f"# Plan\n\n## Task\n{task}\n\n## Implementation\n"
-                f"Implement the task described above with clean Python code.\n"
-                f"\n## Context\n{combined[:1000]}",
-                encoding="utf-8"
+            search_ctx = arch_context.get("_search_result", "")
+            fallback_plan = (
+                f"# Implementation Plan\n\n"
+                f"## Task\n{task}\n\n"
+                f"## Technology Stack\n"
+                f"- Python 3 (stdlib: math, os, sys, json)\n"
+                f"- Only use packages available in the environment\n\n"
+                f"## Files\n```\nmain.py    # Main implementation — all core logic\n```\n\n"
+                f"## File Details\n### main.py\n"
+                f"- Implement the task described above\n"
+                f"- Include a `main()` entry point\n"
+                f"- Include `if __name__ == '__main__': main()` guard\n\n"
+                f"## Implementation Order\n1. main.py — write complete implementation\n\n"
+                f"## Testing\n- pytest with tests/test_main.py\n"
             )
+            if search_ctx:
+                fallback_plan += f"\n## Research Context\n{search_ctx[:800]}\n"
+            plan_path.write_text(fallback_plan, encoding="utf-8")
             await self._emit(Event("pipeline", "agent_start",
-                {"task": "Auto-generated plan.md", "stage": "fallback"}))
+                {"task": "Auto-generated structured plan.md", "stage": "fallback"}))
 
         result.architect_summary = plan_path.read_text(encoding="utf-8")[:200]
         await self._emit(Event.done("architect", result.architect_summary))
@@ -288,6 +360,7 @@ class StepPipeline:
                     }))
 
             # ── Phase 1: Run skeleton steps ───────────────────────────────────
+            _t0 = _time.perf_counter()
             await coder_agent.run_steps(all_coder_steps, coder_context, self._emit)
 
             # ── Phase 2: Spec-First — read skeletons, add implement steps ─────
@@ -297,6 +370,19 @@ class StepPipeline:
 
             for filepath in files_with_skeleton:
                 skeleton_path = cfg.workspace / f"_skeleton_{filepath.replace('/', '_')}"
+
+                # Recovery: model may have written to the actual filepath instead of _skeleton_
+                # (common with small models that ignore the path in the prompt).
+                if not skeleton_path.exists():
+                    actual_path = cfg.workspace / filepath
+                    if actual_path.exists():
+                        # Model wrote to main.py instead of _skeleton_main.py — rescue it
+                        import shutil as _sh
+                        _sh.copy(actual_path, skeleton_path)
+                        await self._emit(Event("pipeline", "thought", {
+                            "text": f"Skeleton recovery: {filepath} → {skeleton_path.name}"
+                        }))
+
                 if not skeleton_path.exists():
                     await self._emit(Event("pipeline", "thought", {
                         "text": f"No skeleton for {filepath} — falling back to direct write"
@@ -387,6 +473,8 @@ class StepPipeline:
             for tmp in cfg.workspace.glob("_piece_*.py"):
                 tmp.unlink(missing_ok=True)
 
+            _timing[f"coder_iter{iteration}"] = round(_time.perf_counter() - _t0, 2)
+
             # Verify at least one .py file was created
             py_files = list(cfg.workspace.glob("*.py")) + list(cfg.workspace.glob("**/*.py"))
             py_files = [f for f in py_files if "test_" not in f.name and "__init__" not in f.name]
@@ -435,7 +523,9 @@ class StepPipeline:
                 tester_agent   = _step_agent("tester", TESTER_TOOLS, TESTER_SYSTEM)
                 tester_context: dict = {"_memory": {}, "_workspace": str(cfg.workspace)}
                 tester_step_list = tester_steps(task, cfg.workspace)
+                _t0_tester = _time.perf_counter()
                 await tester_agent.run_steps(tester_step_list, tester_context, self._emit)
+                _timing[f"tester_iter{iteration}"] = round(_time.perf_counter() - _t0_tester, 2)
 
                 # Quality gate: tests created?
                 test_files = (list(cfg.workspace.rglob("test_*.py"))
@@ -456,7 +546,9 @@ class StepPipeline:
             reviewer_agent   = _step_agent("reviewer", REVIEWER_TOOLS, REVIEWER_SYSTEM)
             reviewer_context: dict = {"_memory": {}}
             reviewer_step_list = reviewer_steps(task, cfg.workspace)
+            _t0_reviewer = _time.perf_counter()
             await reviewer_agent.run_steps(reviewer_step_list, reviewer_context, self._emit)
+            _timing[f"reviewer_iter{iteration}"] = round(_time.perf_counter() - _t0_reviewer, 2)
 
             # Quality gate: review.md created?
             review_file = cfg.workspace / "review.md"
@@ -508,22 +600,8 @@ class StepPipeline:
             "iterations":    len(result.iterations),
             "final_verdict": result.final_verdict,
             "workspace":     str(cfg.workspace),
+            "timing":        _timing,
         }))
-
-        # ── History: close run record + snapshot workspace ────────────────────
-        if _history and _run_id:
-            try:
-                summary = {
-                    "iterations":    len(result.iterations),
-                    "final_verdict": result.final_verdict,
-                    "architect":     result.architect_summary or "",
-                }
-                _history.finish_run(_run_id, result.final_verdict, summary)
-                if result.final_verdict == "PASS":
-                    # Only snapshot successful runs — used later for Golden Examples
-                    _history.save_workspace_snapshot(_run_id, cfg.workspace)
-            except Exception:
-                pass
 
         return result
 
@@ -535,31 +613,20 @@ class StepPipeline:
         skeleton_code: str,
         coder_system: str,
         workspace:    Path,
-        max_concurrent: int = 3,   # semaphore — don't overwhelm local model
+        max_concurrent: int = 3,
     ) -> dict:
         """
         Implement all functions in a file in PARALLEL.
 
-        Each function gets:
-          - Its own isolated context (no shared state between functions)
-          - Its own StepAgent + provider instance
-          - Writes to a unique _piece_*.py file (no file conflicts)
-
-        Results are merged by order after all coroutines complete.
-        Uses asyncio.Semaphore to limit concurrent LLM calls
-        (default 3 — safe for local Ollama; increase for cloud APIs).
-
-        Returns merged context dict with _pieces sorted by order.
+        Critical fix: each worker gets a WRAPPED executor that intercepts
+        write_file calls and forces the path to _piece_*.py — preventing
+        the model from writing to the target file directly (race condition).
         """
         from agents.step_definitions import implement_steps as _make_impl_steps
 
         impl_steps = _make_impl_steps(
-            task          = task,
-            filepath      = filepath,
-            specs         = specs,
-            skeleton_code = skeleton_code,
-            file_num      = 1,
-            total_files   = 1,
+            task=task, filepath=filepath, specs=specs,
+            skeleton_code=skeleton_code, file_num=1, total_files=1,
         )
 
         if not impl_steps:
@@ -568,10 +635,32 @@ class StepPipeline:
         semaphore = asyncio.Semaphore(max_concurrent)
         total     = len(impl_steps)
 
+        # ── Extract piece_path from each step's prompt ─────────────────────────
+        def _extract_piece_path(step) -> str:
+            """Get the _piece_*.py path from step prompt."""
+            import re
+            m = re.search(r'write_file\(path="(_piece_[^"]+)"', step.prompt)
+            return m.group(1) if m else ""
+
+        # ── Executor wrapper: force write_file to piece path ──────────────────
+        def _make_piece_executor(piece_path: str):
+            """
+            Wrap the real executor so ALL write_file calls go to piece_path.
+            This prevents the model from writing to utils.py/main.py directly
+            (which causes race conditions in parallel mode).
+            """
+            real_executor = self._executor
+            def wrapped(tool_name, args, memory):
+                if tool_name == "write_file" and piece_path:
+                    args = dict(args)  # copy to avoid mutation
+                    args["path"] = piece_path
+                return real_executor(tool_name, args, memory)
+            return wrapped
+
         # ── Per-function coroutine ─────────────────────────────────────────────
         async def _run_one(step, step_idx: int) -> dict:
-            """Run one implement step in isolation. Returns its context."""
             spec_name = step.prompt.split("\n")[0].replace("Implement: ", "").strip()
+            piece_path = _extract_piece_path(step)
 
             ctx: dict = {
                 "_memory":       {},
@@ -587,11 +676,14 @@ class StepPipeline:
                     "total": total,
                 }))
 
+                # Each worker gets its own executor that forces writes to piece_path
+                piece_executor = _make_piece_executor(piece_path)
+
                 agent = StepAgent(
                     name          = "coder",
                     provider      = self._make_provider("coder"),
                     tools         = CODER_TOOLS,
-                    executor      = self._executor,
+                    executor      = piece_executor,
                     system        = coder_system,
                     stream_tokens = self._cfg.stream_tokens,
                 )
@@ -603,6 +695,23 @@ class StepPipeline:
                     "text": f"{status} {spec_name} {'done' if ok else 'failed'}"
                 }))
 
+            # Read piece from disk (now guaranteed to be at piece_path)
+            if piece_path:
+                full_piece = workspace / piece_path
+                if full_piece.exists():
+                    code = full_piece.read_text(encoding="utf-8")
+                    # Parse function name from spec_name
+                    parts = spec_name.split(".")
+                    func_name = parts[-1] if parts else spec_name
+                    class_name = parts[0] if len(parts) > 1 else ""
+                    ctx.setdefault("_pieces", []).append({
+                        "kind":  "method" if class_name else "function",
+                        "name":  func_name,
+                        "class": class_name,
+                        "code":  code,
+                        "order": step_idx,
+                    })
+
             return ctx
 
         # ── Fire all in parallel ───────────────────────────────────────────────
@@ -613,7 +722,7 @@ class StepPipeline:
 
         contexts = await asyncio.gather(
             *[_run_one(step, i) for i, step in enumerate(impl_steps)],
-            return_exceptions=True,   # don't abort all if one fails
+            return_exceptions=True,
         )
 
         # ── Merge results ──────────────────────────────────────────────────────
@@ -627,12 +736,11 @@ class StepPipeline:
             pieces = ctx.get("_pieces", [])
             merged_pieces.extend(pieces)
 
-        # Sort by original order so assembly is deterministic
         merged_pieces.sort(key=lambda p: p.get("order", 0))
 
         await self._emit(Event("pipeline", "thought", {
             "text": (
-                f"Parallel impl done: {len(merged_pieces)} pieces assembled"
+                f"Parallel impl done: {len(merged_pieces)} pieces"
                 + (f", {errors} failed" if errors else "")
             )
         }))

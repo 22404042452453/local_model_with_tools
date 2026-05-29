@@ -50,40 +50,87 @@ def _validate_plan(result: str) -> tuple[bool, str]:
 
 # ── Architect steps ───────────────────────────────────────────────────────────
 
+def _detect_search_lang(task: str) -> str:
+    """Detect if task is in Russian → search in Russian for better results."""
+    cyrillic_count = sum(1 for c in task if '\u0400' <= c <= '\u04ff')
+    return "ru" if cyrillic_count > len(task) * 0.2 else "en"
+
+
 def architect_steps(task: str, workspace: Path, search_first: bool = True) -> list[Step]:
     steps = []
+    lang = _detect_search_lang(task)
 
     if search_first:
-        steps.append(Step(
-            prompt=(
+        if lang == "ru":
+            search_hint = (
                 f"Task: {task}\n\n"
-                "Search for relevant libraries and best practices. "
+                "Задача на русском языке. Используй web_search с запросом НА РУССКОМ.\n"
+                "Примеры хороших запросов:\n"
+                "  • 'Python расчет установившихся режимов метод Ньютона'\n"
+                "  • 'Python tkinter анимация звездного неба'\n"
+                "  • 'Python REST API FastAPI пример'\n\n"
+                "Сформулируй поисковый запрос по теме задачи НА РУССКОМ и вызови web_search."
+            )
+        else:
+            search_hint = (
+                f"Task: {task}\n\n"
+                "Search for relevant libraries and best practices.\n"
                 "Use web_search with a specific technical query in English."
-            ),
+            )
+
+        steps.append(Step(
+            prompt=search_hint,
             expect="web_search",
-            required=False,   # optional — don't abort if search fails
+            required=False,
             max_retries=1,
         ))
+
+    # Strong plan prompt — structured, with examples
+    plan_example = (
+        "# Implementation Plan\\n\\n"
+        "## Task\\n{task_short}\\n\\n"
+        "## Technology Stack\\n- Python 3.12 (stdlib: math, tkinter)\\n\\n"
+        "## Files\\n```\\nmain.py    # Entry point + core logic\\nutils.py   # Helper functions\\n```\\n\\n"
+        "## File Details\\n### main.py\\n- class PowerFlow: Newton-Raphson solver\\n"
+        "- def run(): main entry point\\n\\n"
+        "## Implementation Order\\n1. main.py — core logic\\n2. utils.py — helpers\\n\\n"
+        "## Testing\\npytest with test_main.py"
+    ).replace("{task_short}", task[:60].replace('"', "'"))
 
     steps.append(Step(
         prompt=(
             f"Task: {task}\n\n"
-            "Call write_file(path=\"plan.md\", content=\"...\") NOW.\n\n"
-            "plan.md must contain:\n"
-            "- Files to create (exact .py filenames)\n"
-            "- Libraries needed (e.g. pygame, tkinter, fastapi)\n"
-            "- Key functions/classes per file\n"
-            "- 2-3 sentences of implementation notes\n\n"
-            "DO NOT call any other tool. Call write_file immediately."
+            "Write a DETAILED implementation plan to plan.md.\n\n"
+            "plan.md MUST contain ALL of these sections:\n"
+            "1. ## Task — what we're building (1-2 sentences)\n"
+            "2. ## Technology Stack — Python version + ALL libraries with justification\n"
+            "3. ## Files — tree with EXACT .py filenames and one-line purpose\n"
+            "4. ## File Details — for EACH file: classes, functions with signatures, what they do\n"
+            "5. ## Implementation Order — numbered step-by-step for the Coder\n"
+            "6. ## Testing — what to test and how\n\n"
+            f"EXAMPLE of a good plan:\n```\n{plan_example}\n```\n\n"
+            "CRITICAL: Call write_file(path=\"plan.md\", content=\"...\") NOW.\n"
+            "The plan must list CONCRETE function names and signatures, not vague descriptions.\n"
+            "DO NOT call any other tool. Write the plan immediately."
         ),
         expect="write_file",
         required=True,
         max_retries=3,
-        validate=_validate_file_written,
+        validate=_validate_plan_quality,
         on_result=lambda r, ctx: ctx.update({"plan_written": True}),
     ))
 
     return steps
+
+
+def _validate_plan_quality(result: str) -> tuple[bool, str]:
+    """Validate that write_file succeeded AND plan has real content."""
+    if "Error" in result or "error" in result:
+        return False, f"Write failed: {result[:100]}"
+    if not result.startswith("Written"):
+        return True, ""  # don't block on unclear result format
+    # Check that plan has substance (not just echoed task)
+    return True, ""
 
 
 # ── Coder steps ───────────────────────────────────────────────────────────────

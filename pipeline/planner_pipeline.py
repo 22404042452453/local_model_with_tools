@@ -52,13 +52,16 @@ class PlannerPipeline:
     # ── Run ───────────────────────────────────────────────────────────────────
 
     async def run(self, task: str, clean_workspace: bool = False) -> PlannerResult:
+        import time as _time
+        _t_start = _time.perf_counter()
+
         cfg = self.config
         cfg.workspace.mkdir(parents=True, exist_ok=True)
 
         result = PlannerResult()
 
         # ── Step 1: Planner decomposes the task ───────────────────────────────
-        provider = make_provider(**cfg.provider_kwargs("architect"))  # use architect config
+        provider = make_provider(**cfg.provider_kwargs("architect"))
         executor = make_executor(cfg.workspace)
 
         planner = make_planner(
@@ -73,32 +76,54 @@ class PlannerPipeline:
             data={"task": task, "stage": "planner"}
         ))
 
+        _t0 = _time.perf_counter()
         planner_summary, verdict = await planner.run(
             f"Break this into subtasks: {task}", self._emit
         )
+        _planner_time = round(_time.perf_counter() - _t0, 2)
 
         if verdict == "FAIL" or planner_summary is None:
             await self._emit(Event.error("pipeline", "Planner failed."))
-            return result
 
-        # ── Step 2: Read tasks.json ────────────────────────────────────────────
+        # ── Step 2: Read tasks.json (with robust fallback) ────────────────────
         tasks_file = cfg.workspace / "tasks.json"
 
-        # Fallback: if planner didn't create tasks.json, make one from its summary
-        if not tasks_file.exists() and planner_summary:
+        # Fallback: if planner didn't create tasks.json — ALWAYS create one.
+        # Previous bug: fallback only triggered if planner_summary was truthy.
+        # Now we create a single-task fallback regardless.
+        if not tasks_file.exists():
+            desc = planner_summary or task
+            # Try to extract useful context from planner's search results
+            search_ctx = ""
+            for f in cfg.workspace.glob("*.md"):
+                try:
+                    search_ctx = f.read_text(encoding="utf-8")[:500]
+                    break
+                except Exception:
+                    pass
+
             fallback_tasks = [{
                 "id": "task_1",
                 "title": task[:60],
-                "description": planner_summary,
+                "description": (
+                    f"{desc}\n\n"
+                    f"Original request: {task}\n"
+                    + (f"Research context:\n{search_ctx}" if search_ctx else "")
+                ),
                 "workspace": str(cfg.workspace / "task_1"),
                 "depends_on": []
             }]
-            tasks_file.write_text(json.dumps(fallback_tasks, ensure_ascii=False, indent=2),
-                                  encoding="utf-8")
-            await self._emit(Event("pipeline", "agent_start",
-                {"task": "Auto-created tasks.json from planner output", "stage": "fallback"}))
+            tasks_file.write_text(
+                json.dumps(fallback_tasks, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            await self._emit(Event("pipeline", "agent_start", {
+                "task": "Auto-created tasks.json (planner didn't write it)",
+                "stage": "fallback",
+            }))
 
         if not tasks_file.exists():
+            # Should never happen after fallback above — safety net
             await self._emit(Event.error("pipeline", "Planner did not produce tasks.json"))
             return result
 
@@ -216,9 +241,14 @@ class PlannerPipeline:
 
         result.success = len(result.failed_tasks) == 0
 
+        _total_time = round(_time.perf_counter() - _t_start, 2)
         await self._emit(Event.pipeline_done({
             "tasks":         len(result.tasks),
             "failed":        result.failed_tasks,
             "final_verdict": "PASS" if result.success else "FAIL",
+            "timing": {
+                "planner": _planner_time,
+                "total":   _total_time,
+            },
         }))
         return result

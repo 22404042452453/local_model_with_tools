@@ -239,6 +239,13 @@ async def api_delete_run(run_id: int):
     return {"deleted": True}
 
 
+@app.post("/api/runs/cleanup")
+async def api_cleanup_stale():
+    """Mark all 'running' records as crashed."""
+    cleaned = _get_history().cleanup_stale()
+    return {"cleaned": cleaned}
+
+
 @app.get("/api/stats")
 async def api_stats():
     return _get_history().get_stats()
@@ -287,3 +294,11 @@ def init_extensions(config):
     _plugin_registry = get_registry(Path(__file__).parent.parent / "plugins")
 
     _get_history()  # init db
+
+    # Clean up stale "running" records — server just started, nothing is running
+    try:
+        cleaned = _get_history().cleanup_stale()  # default: clean ALL running
+        if cleaned:
+            print(f"  Cleaned {cleaned} stale 'running' records from history")
+    except Exception:
+        pass
