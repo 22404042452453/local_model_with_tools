@@ -53,11 +53,48 @@ class Router:
     def __init__(self, config: Config):
         self.config = config
 
+    def _keyword_classify(self, task: str) -> str | None:
+        """Fast keyword-based pre-filter for obvious cases.
+        Returns task_type or None if LLM should decide."""
+        t = task.lower()
+
+        # ── Research signals ──────────────────────────────────────────────────
+        research_kw = [
+            "найди информацию", "найти информацию", "собери информацию",
+            "напиши статью", "напиши доклад", "напиши реферат", "напиши отчёт",
+            "напиши отчет", "сведи информацию", "расскажи про", "расскажи о",
+            "что такое", "как работает", "объясни", "исследуй",
+            "write a report", "write an article", "write a document",
+            "research", "explain", "what is", "how does", "summarize",
+            "find information", "gather information", "compile information",
+            "в ворд", "в word", "в документ",
+        ]
+        # If task has NO code-related words and HAS research keywords → research
+        code_kw = [
+            "напиши код", "написать код", "скрипт", "реализуй", "implement",
+            "write code", "build", "create app", "api", "function", "class",
+            "def ", "import ", "pip install", ".py", ".js", ".ts",
+        ]
+        has_research = any(kw in t for kw in research_kw)
+        has_code     = any(kw in t for kw in code_kw)
+
+        if has_research and not has_code:
+            return "research"
+        return None  # let LLM decide
+
     async def classify(self, task: str) -> RouterDecision:
         """
         Calls the LLM once to classify the task.
         Falls back to "coding" on any error.
+        Uses keyword pre-filter for obvious cases.
         """
+        # Fast path: obvious cases don't need an LLM call
+        kw_type = self._keyword_classify(task)
+        if kw_type:
+            return RouterDecision(task_type=kw_type,
+                                  reason=f"Keyword match → {kw_type}",
+                                  raw="(keyword pre-filter)")
+
         provider = make_provider(**self.config.provider_kwargs("architect"))
 
         messages = [{"role": "user", "content": f"Task: {task}"}]
@@ -165,7 +202,7 @@ class RouterPipeline:
             while True:
                 ev = await queue.get()
                 await self._emit(ev)
-                if ev.type in ("pipeline_done", "error") and ev.agent == "pipeline":
+                if ev.type == "pipeline_done":
                     break
 
         result, _ = await asyncio.gather(

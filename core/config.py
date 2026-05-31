@@ -21,32 +21,39 @@ class AgentProviderConfig:
     Provider settings for a single agent.
     None = inherit from global Config.
     """
-    backend:    str | None = None
-    model:      str | None = None
-    api_key:    str | None = None
-    base_url:   str | None = None
-    max_tokens: int | None = None
+    backend:        str | None  = None
+    model:          str | None  = None
+    api_key:        str | None  = None
+    base_url:       str | None  = None
+    max_tokens:     int | None  = None
+    supports_tools: bool | None = None   # None=auto-detect, False=prompt-based
 
     def resolve(self, global_cfg: "Config") -> dict:
         """Return final kwargs for make_provider(), merging with global defaults."""
         return {
-            "backend":    self.backend    or global_cfg.backend,
-            "model":      self.model      or global_cfg.model,
-            "api_key":    self.api_key    or global_cfg.api_key,
-            "base_url":   self.base_url   or global_cfg.base_url,
-            "max_tokens": self.max_tokens or global_cfg.max_tokens,
+            "backend":        self.backend    or global_cfg.backend,
+            "model":          self.model      or global_cfg.model,
+            "api_key":        self.api_key    or global_cfg.api_key,
+            "base_url":       self.base_url   or global_cfg.base_url,
+            "max_tokens":     self.max_tokens or global_cfg.max_tokens,
+            "supports_tools": self.supports_tools,
         }
 
     @classmethod
     def from_env(cls, prefix: str) -> "AgentProviderConfig":
         """Load from env vars like ARCHITECT_BACKEND, ARCHITECT_MODEL, etc."""
         p = prefix.upper()
+        st_raw = os.getenv(f"{p}_SUPPORTS_TOOLS")
+        supports_tools = None
+        if st_raw is not None:
+            supports_tools = st_raw.lower() in ("true", "1", "yes")
         return cls(
-            backend    = os.getenv(f"{p}_BACKEND"),
-            model      = os.getenv(f"{p}_MODEL"),
-            api_key    = os.getenv(f"{p}_API_KEY"),
-            base_url   = os.getenv(f"{p}_BASE_URL"),
-            max_tokens = int(os.getenv(f"{p}_MAX_TOKENS", "0")) or None,
+            backend        = os.getenv(f"{p}_BACKEND"),
+            model          = os.getenv(f"{p}_MODEL"),
+            api_key        = os.getenv(f"{p}_API_KEY"),
+            base_url       = os.getenv(f"{p}_BASE_URL"),
+            max_tokens     = int(os.getenv(f"{p}_MAX_TOKENS", "0")) or None,
+            supports_tools = supports_tools,
         )
 
 
@@ -61,11 +68,16 @@ class Config:
     base_url:   str|None = None
     max_tokens: int      = 2048
 
-    # ── Per-agent provider overrides ──────────────────────────────────────────
-    architect_cfg: AgentProviderConfig = field(default_factory=AgentProviderConfig)
-    coder_cfg:     AgentProviderConfig = field(default_factory=AgentProviderConfig)
-    tester_cfg:    AgentProviderConfig = field(default_factory=AgentProviderConfig)
-    reviewer_cfg:  AgentProviderConfig = field(default_factory=AgentProviderConfig)
+    # ── Per-agent provider overrides (coding pipeline) ─────────────────────
+    architect_cfg:  AgentProviderConfig = field(default_factory=AgentProviderConfig)
+    coder_cfg:      AgentProviderConfig = field(default_factory=AgentProviderConfig)
+    tester_cfg:     AgentProviderConfig = field(default_factory=AgentProviderConfig)
+    reviewer_cfg:   AgentProviderConfig = field(default_factory=AgentProviderConfig)
+
+    # ── Per-agent provider overrides (research pipeline) ─────────────────────
+    researcher_cfg: AgentProviderConfig = field(default_factory=AgentProviderConfig)
+    writer_cfg:     AgentProviderConfig = field(default_factory=AgentProviderConfig)
+    editor_cfg:     AgentProviderConfig = field(default_factory=AgentProviderConfig)
 
     # ── Pipeline behaviour ────────────────────────────────────────────────────
     max_steps:             int  = 25
@@ -88,10 +100,13 @@ class Config:
     def provider_kwargs(self, agent: str) -> dict:
         """Return resolved provider kwargs for a named agent."""
         cfg_map = {
-            "architect": self.architect_cfg,
-            "coder":     self.coder_cfg,
-            "tester":    self.tester_cfg,
-            "reviewer":  self.reviewer_cfg,
+            "architect":  self.architect_cfg,
+            "coder":      self.coder_cfg,
+            "tester":     self.tester_cfg,
+            "reviewer":   self.reviewer_cfg,
+            "researcher": self.researcher_cfg,
+            "writer":     self.writer_cfg,
+            "editor":     self.editor_cfg,
         }
         return cfg_map[agent].resolve(self)
 
@@ -110,11 +125,15 @@ class Config:
             workspace      = Path(os.getenv("AGENT_WORKSPACE", "./workspace")),
             host           = os.getenv("AGENT_HOST", "127.0.0.1"),
             port           = int(os.getenv("AGENT_PORT", "8000")),
-            # Per-agent
+            # Per-agent (coding pipeline)
             architect_cfg  = AgentProviderConfig.from_env("architect"),
             coder_cfg      = AgentProviderConfig.from_env("coder"),
             tester_cfg     = AgentProviderConfig.from_env("tester"),
             reviewer_cfg   = AgentProviderConfig.from_env("reviewer"),
+            # Per-agent (research pipeline)
+            researcher_cfg = AgentProviderConfig.from_env("researcher"),
+            writer_cfg     = AgentProviderConfig.from_env("writer"),
+            editor_cfg     = AgentProviderConfig.from_env("editor"),
         )
 
 

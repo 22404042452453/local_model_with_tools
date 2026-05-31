@@ -84,7 +84,7 @@ async def run_pipeline(body: dict):
             while True:
                 ev = await queue.get()
                 await _broadcast(ev.to_dict())
-                if ev.type in ("pipeline_done", "error") and ev.agent == "pipeline":
+                if ev.type == "pipeline_done":
                     break
 
         await asyncio.gather(
@@ -175,7 +175,7 @@ async def run_planner(body: dict):
             while True:
                 ev = await queue.get()
                 await _broadcast(ev.to_dict())
-                if ev.type in ("pipeline_done", "error") and ev.agent == "pipeline":
+                if ev.type == "pipeline_done":
                     break
 
         await asyncio.gather(

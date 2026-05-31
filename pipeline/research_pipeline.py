@@ -58,15 +58,33 @@ class ResearchPipeline:
         executor = make_executor(cfg.workspace)
 
         def _provider(name: str):
-            # Research agents reuse architect/coder/reviewer slots for config
-            slot_map = {"researcher": "architect", "writer": "coder", "editor": "reviewer"}
-            return make_provider(**cfg.provider_kwargs(slot_map.get(name, name)))
+            return make_provider(**cfg.provider_kwargs(name))
 
         def _kw(name: str) -> dict:
             return dict(provider=_provider(name), executor=executor,
                         max_steps=cfg.max_steps, stream=cfg.stream_tokens)
 
         result = ResearchResult(workspace=cfg.workspace)
+
+        try:
+            await self._run_research(task, cfg, executor, _provider, _kw, result)
+        except Exception as e:
+            result.success = False
+            await self._emit(Event.error("pipeline", f"Research pipeline crashed: {e}"))
+        finally:
+            # Always emit pipeline_done so forward() loop can exit
+            try:
+                await self._emit(Event.pipeline_done({
+                    "verdict": "PASS" if result.success else "FAIL",
+                    "workspace": str(cfg.workspace),
+                }))
+            except Exception:
+                pass
+
+        return result
+
+    async def _run_research(self, task, cfg, executor, _provider, _kw, result):
+        """Inner research logic — wrapped by run() for crash safety."""
 
         await self._emit(Event("pipeline", "agent_start",
                                {"task": "Researcher → Writer → Editor", "stage": "research"}))
@@ -130,10 +148,4 @@ class ResearchPipeline:
             previous_feedback = _extract_issues(editor_summary or "")
 
         result.success = result.final_verdict == "PASS"
-        await self._emit(Event.pipeline_done({
-            "type":          "research",
-            "final_verdict": result.final_verdict,
-            "workspace":     str(cfg.workspace),
-            "output_file":   "final_document.md",
-        }))
         return result

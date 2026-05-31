@@ -95,14 +95,26 @@ class StepPipeline:
 
         # Wrap ENTIRE pipeline in try/finally to guarantee finish_run is called.
         # Without this, any exception leaves the run as "running" forever.
+        _pipeline_done_emitted = False
         try:
             result = await self._run_pipeline(task, cfg, executor, _timing, _plugin_registry)
+            _pipeline_done_emitted = True  # _run_pipeline emits pipeline_done on success
         except Exception as e:
             result = PipelineResult(workspace=cfg.workspace)
             result.final_verdict = "FAIL"
             result.success = False
             await self._emit(Event.error("pipeline", f"Pipeline crashed: {e}"))
         finally:
+            # ── Always emit pipeline_done so forward() loop can exit ─────────
+            if not _pipeline_done_emitted:
+                try:
+                    await self._emit(Event.pipeline_done({
+                        "verdict": getattr(result, "final_verdict", "FAIL"),
+                        "workspace": str(cfg.workspace),
+                    }))
+                except Exception:
+                    pass
+
             # ── History: ALWAYS close run record ──────────────────────────────
             if _history and _run_id:
                 try:
@@ -231,6 +243,31 @@ class StepPipeline:
                 {"task": "Auto-generated structured plan.md", "stage": "fallback"}))
 
         result.architect_summary = plan_path.read_text(encoding="utf-8")[:200]
+
+        # ── Plan quality gate ────────────────────────────────────────────────
+        plan_content = plan_path.read_text(encoding="utf-8")
+        plan_issues  = _validate_plan(plan_content)
+
+        if plan_issues:
+            await self._emit(Event("pipeline", "thought", {
+                "text": f"Plan quality issues: {'; '.join(plan_issues)} — fixing with reviewer model..."
+            }))
+            fixed_plan = await self._fix_plan(
+                plan_content, plan_issues, task, env_hint, _provider
+            )
+            if fixed_plan:
+                plan_path.write_text(fixed_plan, encoding="utf-8")
+                plan_content = fixed_plan
+                new_issues = _validate_plan(plan_content)
+                if not new_issues:
+                    await self._emit(Event("pipeline", "thought", {
+                        "text": "✅ Plan fixed — structure is valid now"
+                    }))
+                else:
+                    await self._emit(Event("pipeline", "thought", {
+                        "text": f"Plan still has issues after fix: {'; '.join(new_issues)} — proceeding anyway"
+                    }))
+
         await self._emit(Event.done("architect", result.architect_summary))
 
         # Parse file list from plan.md
@@ -246,6 +283,10 @@ class StepPipeline:
         # ── 2. Coder → Tester → Reviewer loop ─────────────────────────────────
         from core.iteration_memory import IterationMemory, build_memory_from_iteration
         iter_memory: IterationMemory | None = None
+
+        # Track files that already compile/work — don't rewrite them
+        _good_files: set[str] = set()          # files that parse without errors
+        _good_backups: dict[str, str] = {}     # filepath → backup content
 
         for iteration in range(cfg.max_iterations):
             if iteration > 0:
@@ -285,28 +326,51 @@ class StepPipeline:
             # For revision iterations: insert targeted edit_file step BEFORE full rewrites.
             # Uses IterationMemory for structured, precise instructions.
             if iteration > 0 and iter_memory and iter_memory.has_issues():
-                existing_py = [
-                    f.name for f in cfg.workspace.glob("*.py")
-                    if "test_" not in f.name and "__init__" not in f.name
-                ]
-                target_hint = existing_py[0] if existing_py else "main.py"
+                # Find files that need fixing from iteration memory
+                broken_files = []
                 memory_block = iter_memory.render_for_prompt()
-                all_coder_steps.append(step_definitions.Step(
-                    prompt=(
-                        f"Apply targeted fixes to {target_hint}.\n\n"
-                        f"{memory_block}\n\n"
-                        f"Use edit_file(path=\"{target_hint}\", find=\"...\", replace=\"...\") "
-                        f"for each broken location. Fix ONLY what is listed as broken. "
-                        f"DO NOT touch functions marked as working."
-                    ),
-                    expect="edit_file",
-                    required=False,
-                    max_retries=2,
-                    validate=lambda r: (True, "") if r.startswith("Edited") else (False, f"Edit failed: {r[:100]}"),
-                ))
+                for f in (planned_files or []):
+                    if f in memory_block and f not in _good_files:
+                        broken_files.append(f)
+                if not broken_files:
+                    broken_files = [
+                        f.name for f in cfg.workspace.glob("*.py")
+                        if f.name not in _good_files
+                        and "test_" not in f.name
+                        and "__init__" not in f.name
+                    ][:3]  # limit to 3 files
+
+                for target_file in broken_files:
+                    all_coder_steps.append(step_definitions.Step(
+                        prompt=(
+                            f"Apply targeted fixes to {target_file}.\n\n"
+                            f"{memory_block}\n\n"
+                            f"Use edit_file(path=\"{target_file}\", find=\"...\", replace=\"...\") "
+                            f"for each broken location. Fix ONLY what is listed as broken. "
+                            f"DO NOT touch functions marked as working."
+                        ),
+                        expect="edit_file",
+                        required=False,
+                        max_retries=2,
+                        validate=lambda r: (True, "") if r.startswith("Edited") else (False, f"Edit failed: {r[:100]}"),
+                    ))
 
             files_with_functions: list[tuple[str, list[dict]]] = []
             files_with_skeleton:  list[str] = []   # files built via spec-first
+
+            # ── Filter: skip files that already work ─────────────────────────
+            iteration_files = planned_files or []
+            if iteration > 0 and _good_files:
+                skipped = [f for f in iteration_files if f in _good_files]
+                iteration_files = [f for f in iteration_files if f not in _good_files]
+                if skipped:
+                    await self._emit(Event("pipeline", "thought", {
+                        "text": f"Keeping {len(skipped)} working file(s): {', '.join(skipped[:5])}"
+                    }))
+                if not iteration_files:
+                    await self._emit(Event("pipeline", "thought", {
+                        "text": "All files are working — skipping coder, running tests"
+                    }))
 
             # ── Fallback: architect didn't list any files ─────────────────────
             # Common when plan.md has no tree-style file listing.
@@ -319,7 +383,7 @@ class StepPipeline:
                     step_definitions._write_file_step(task, "main.py", "Main implementation file")
                 )
 
-            for idx, filepath in enumerate(planned_files or [], 1):
+            for idx, filepath in enumerate(iteration_files or [], 1):
                 desc  = (file_descriptions or {}).get(filepath, "")
                 funcs = extract_functions_from_plan(plan_content, filepath)
 
@@ -328,7 +392,7 @@ class StepPipeline:
                     all_coder_steps.append(
                         step_definitions._write_file_step(
                             task, filepath, desc,
-                            file_num=idx, total_files=len(planned_files),
+                            file_num=idx, total_files=len(iteration_files),
                         )
                     )
                     continue
@@ -338,7 +402,7 @@ class StepPipeline:
                 all_coder_steps.append(
                     step_definitions.skeleton_step(
                         task, filepath, desc,
-                        file_num=idx, total_files=len(planned_files),
+                        file_num=idx, total_files=len(iteration_files),
                     )
                 )
                 files_with_skeleton.append(filepath)
@@ -455,6 +519,25 @@ class StepPipeline:
                     import shutil as _sh
                     _sh.copy(skeleton_path, cfg.workspace / filepath)
 
+                    # Try to fix skeleton syntax errors with stronger model
+                    assembled_file = cfg.workspace / filepath
+                    import ast as _ast_check
+                    try:
+                        _ast_check.parse(assembled_file.read_text(encoding="utf-8"))
+                    except SyntaxError as syn_err:
+                        await self._emit(Event("pipeline", "thought", {
+                            "text": f"Skeleton {filepath} has syntax errors — running fixer..."
+                        }))
+                        fixed = await self._fix_syntax(
+                            assembled_file,
+                            f"line {syn_err.lineno}: {syn_err.msg}",
+                            _provider, cfg.stream_tokens,
+                        )
+                        if fixed:
+                            await self._emit(Event("pipeline", "thought", {
+                                "text": f"✅ Fixed {filepath} after assembly fallback"
+                            }))
+
             # ── Fallback: if no planned files, run old function-level assembly ─
             for filepath, funcs in files_with_functions:
                 if filepath in files_with_skeleton:
@@ -503,13 +586,88 @@ class StepPipeline:
             # ── Pre-check: does code even parse? ──────────────────────────────
             import ast as _ast
             has_syntax_errors = False
+            files_with_errors: list[tuple[Path, str]] = []
             for pf in py_files:
                 try:
                     _ast.parse(pf.read_text(encoding="utf-8"))
                 except SyntaxError as e:
-                    has_syntax_errors = True
+                    files_with_errors.append((pf, f"line {e.lineno}: {e.msg}"))
                     await self._emit(Event.error("pipeline",
                         f"Syntax error in {pf.name} line {e.lineno}: {e.msg}"))
+
+            # ── Syntax Fixer: use stronger model to repair broken files ───────
+            if files_with_errors:
+                await self._emit(Event("pipeline", "thought", {
+                    "text": f"Attempting syntax fix on {len(files_with_errors)} file(s) "
+                            f"using reviewer model..."
+                }))
+                for pf, err_msg in files_with_errors:
+                    fixed = await self._fix_syntax(
+                        pf, err_msg, _provider, cfg.stream_tokens)
+                    if fixed:
+                        await self._emit(Event("pipeline", "thought", {
+                            "text": f"✅ Fixed {pf.name} syntax"
+                        }))
+                    else:
+                        has_syntax_errors = True
+                        await self._emit(Event.error("pipeline",
+                            f"Could not fix {pf.name} — syntax error remains"))
+
+                # Re-check: maybe all files are fixed now
+                if not has_syntax_errors:
+                    # Verify all files parse cleanly after fix
+                    for pf, _ in files_with_errors:
+                        try:
+                            _ast.parse(pf.read_text(encoding="utf-8"))
+                        except SyntaxError:
+                            has_syntax_errors = True
+                            break
+
+            # ── Track good files: back up anything that parses ────────────────
+            for pf in py_files:
+                try:
+                    code = pf.read_text(encoding="utf-8")
+                    _ast.parse(code)
+                    fname = pf.name
+                    if fname not in _good_files:
+                        _good_files.add(fname)
+                        _good_backups[fname] = code
+                        await self._emit(Event("pipeline", "thought", {
+                            "text": f"✅ Locked {fname} (parses OK, won't rewrite)"
+                        }))
+                    else:
+                        # Update backup with latest good version
+                        _good_backups[fname] = code
+                except SyntaxError:
+                    # Remove from good list if it broke
+                    fname = pf.name
+                    if fname in _good_files:
+                        _good_files.discard(fname)
+                        await self._emit(Event("pipeline", "thought", {
+                            "text": f"⚠️ {fname} broke — unlocked for rewrite"
+                        }))
+
+            # ── Restore good files that got overwritten ──────────────────────
+            for fname, backup_code in _good_backups.items():
+                fpath = cfg.workspace / fname
+                if fpath.exists():
+                    try:
+                        _ast.parse(fpath.read_text(encoding="utf-8"))
+                    except SyntaxError:
+                        # File was overwritten with broken code — restore backup
+                        fpath.write_text(backup_code, encoding="utf-8")
+                        await self._emit(Event("pipeline", "thought", {
+                            "text": f"🔄 Restored {fname} from backup (was overwritten with broken code)"
+                        }))
+
+            # Re-evaluate syntax errors after tracking + restoration
+            has_syntax_errors = False
+            for pf in py_files:
+                try:
+                    _ast.parse(pf.read_text(encoding="utf-8"))
+                except SyntaxError:
+                    has_syntax_errors = True
+                    break
 
             # ── Tester (skip if code doesn't parse) ───────────────────────────
             if has_syntax_errors:
@@ -747,6 +905,118 @@ class StepPipeline:
 
         return {"_workspace": str(workspace), "_pieces": merged_pieces}
 
+    async def _fix_plan(
+        self, plan_text: str, issues: list[str], task: str,
+        env_hint: str, provider_factory,
+    ) -> str | None:
+        """Use reviewer model to fix a low-quality plan."""
+        import asyncio
+
+        provider = provider_factory("reviewer")
+
+        prompt = (
+            f"The architect wrote this plan for the task, but it has problems:\n\n"
+            f"PROBLEMS:\n" + "\n".join(f"- {i}" for i in issues) + "\n\n"
+            f"ORIGINAL TASK: {task}\n\n"
+            f"ENVIRONMENT:\n{env_hint}\n\n"
+            f"CURRENT PLAN:\n{plan_text}\n\n"
+            f"Rewrite the plan to fix ALL listed problems. The plan MUST contain:\n"
+            f"1. ## Task — what we're building\n"
+            f"2. ## Technology Stack — ONLY packages from the environment\n"
+            f"3. ## Files — directory tree with exact .py filenames\n"
+            f"4. ## File Details — for each file: purpose, key functions/classes with names and signatures\n"
+            f"5. ## Implementation Order\n"
+            f"6. ## Testing — what to test\n\n"
+            f"Output ONLY the plan text in Markdown. No explanations."
+        )
+
+        system = (
+            "You are a senior software architect reviewing and fixing implementation plans. "
+            "Output ONLY the corrected plan in Markdown format."
+        )
+
+        try:
+            resp = await asyncio.to_thread(
+                provider.complete,
+                [{"role": "user", "content": prompt}],
+                [], system, None,
+            )
+            fixed = (resp.get("text") or "").strip()
+
+            # Strip markdown fences
+            import re
+            fixed = re.sub(r'^```(?:markdown)?\s*\n?', '', fixed)
+            fixed = re.sub(r'\n?```\s*$', '', fixed)
+            fixed = fixed.strip()
+
+            if len(fixed) > len(plan_text) * 0.5 and len(fixed) > 200:
+                return fixed
+            return None
+        except Exception as e:
+            await self._emit(Event.error("pipeline", f"Plan fixer error: {e}"))
+            return None
+
+    async def _fix_syntax(
+        self, filepath: Path, error_msg: str,
+        provider_factory, stream: bool,
+    ) -> bool:
+        """Use the reviewer model (stronger) to fix syntax errors in a file.
+        Returns True if fix succeeded."""
+        import ast as _ast
+        import asyncio
+
+        try:
+            broken_code = filepath.read_text(encoding="utf-8")
+        except Exception:
+            return False
+
+        # Use reviewer model — typically stronger than coder
+        provider = provider_factory("reviewer")
+
+        prompt = (
+            f"This Python file has a syntax error: {error_msg}\n\n"
+            f"```python\n{broken_code}\n```\n\n"
+            f"Fix the syntax error and return ONLY the corrected Python code. "
+            f"No explanations, no markdown fences. Just the code."
+        )
+
+        system = (
+            "You are a Python syntax fixer. You receive broken Python code and "
+            "return ONLY the fixed code. Never add explanations or markdown. "
+            "Fix ONLY the syntax error, do not change the logic."
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            resp = await asyncio.to_thread(
+                provider.complete, messages, [], system, None
+            )
+            fixed_code = (resp.get("text") or "").strip()
+
+            # Strip markdown fences if model added them
+            import re
+            fixed_code = re.sub(r'^```(?:python)?\s*\n?', '', fixed_code)
+            fixed_code = re.sub(r'\n?```\s*$', '', fixed_code)
+            fixed_code = fixed_code.strip()
+
+            if not fixed_code or len(fixed_code) < 20:
+                return False
+
+            # Verify the fix actually parses
+            try:
+                _ast.parse(fixed_code)
+            except SyntaxError:
+                return False
+
+            # Write fixed code
+            filepath.write_text(fixed_code, encoding="utf-8")
+            return True
+
+        except Exception as e:
+            await self._emit(Event.error("pipeline", f"Syntax fixer error: {e}"))
+            return False
+
     def _run_tests(self, workspace: Path) -> tuple[str, str]:
         """Run pytest and return (verdict, output)."""
         try:
@@ -764,6 +1034,71 @@ class StepPipeline:
             return "FAIL", "Tests timed out after 60s"
         except Exception as e:
             return "FAIL", f"Test run error: {e}"
+
+
+# ── Plan validator ────────────────────────────────────────────────────────────
+
+def _validate_plan(plan_text: str) -> list[str]:
+    """
+    Check plan.md for quality issues.
+    Returns list of problems (empty = plan is OK).
+
+    A good plan has:
+    - File tree with .py filenames
+    - Function/class descriptions per file
+    - Enough detail for coder to work from (not just 3 lines)
+    """
+    import re
+
+    issues: list[str] = []
+
+    if not plan_text or len(plan_text.strip()) < 100:
+        issues.append("Plan is too short (<100 chars)")
+        return issues  # no point checking further
+
+    # ── Must list at least one .py file ──────────────────────────────────
+    py_files = re.findall(r'[\w/\-]+\.py\b', plan_text)
+    if not py_files:
+        issues.append("No .py filenames found — coder won't know what files to create")
+
+    # ── Must have function/class descriptions ────────────────────────────
+    has_func_hints = bool(re.search(
+        r'(?:def |class |function|метод|класс|функция|func\s|method\s)',
+        plan_text, re.IGNORECASE
+    ))
+    if not has_func_hints:
+        issues.append("No function/class descriptions — coder won't know what to implement")
+
+    # ── Must have some structure (headers) ───────────────────────────────
+    headers = re.findall(r'^#{1,3}\s+.+', plan_text, re.MULTILINE)
+    if len(headers) < 2:
+        issues.append("Plan lacks structure (needs at least ## Task, ## Files sections)")
+
+    # ── File descriptions should be specific ─────────────────────────────
+    if py_files and len(py_files) > 1:
+        # For multi-file projects, each file should have some description
+        described_files = 0
+        for f in py_files:
+            basename = f.split("/")[-1]
+            # Check if file has description nearby (within 200 chars after mention)
+            pattern = re.escape(basename) + r'.{0,200}'
+            match = re.search(pattern, plan_text, re.DOTALL)
+            if match:
+                context = match.group(0)
+                if len(context) > len(basename) + 10:  # more than just the filename
+                    described_files += 1
+        if described_files < len(py_files) * 0.5:
+            issues.append(f"Only {described_files}/{len(py_files)} files have descriptions")
+
+    # ── Technology stack should be mentioned ──────────────────────────────
+    has_stack = bool(re.search(
+        r'(?:stack|стек|технолог|python|package|пакет|import)',
+        plan_text, re.IGNORECASE
+    ))
+    if not has_stack:
+        issues.append("No technology stack section")
+
+    return issues
 
 
 # ── Plan parser ───────────────────────────────────────────────────────────────

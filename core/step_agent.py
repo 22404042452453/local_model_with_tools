@@ -339,6 +339,19 @@ class StepAgent:
             args = dict(args)
             args["path"] = args["path"].lstrip("/\\")
 
+        # ── Pre-write quality gate: reject garbage content before disk write ──
+        if name == "write_file" and "content" in args:
+            filepath = args.get("path", "")
+            content = args["content"]
+            if filepath.endswith(".py") and isinstance(content, str):
+                if not self._validate_code_quality(content):
+                    err = "Content rejected by quality gate (repetitive, garbage, or no meaningful code)"
+                    await emit(Event.tool_call(self.name, name, {"path": filepath, "content": "[REJECTED]"}))
+                    await emit(Event.error(self.name, err))
+                    err_key = f"_step_{id(step)}_error"
+                    context[err_key] = err
+                    return err, name
+
         await emit(Event.tool_call(self.name, name, args))
         memory = context.get("_memory", {})
         result, _ = self.executor(name, args, memory)
@@ -364,6 +377,12 @@ class StepAgent:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    @property
+    def _is_simple_model(self) -> bool:
+        """Check if provider is a small model without tool support.
+        Simple models get dramatically shorter prompts."""
+        return getattr(self.provider, '_supports_tools', None) is False
+
     def _no_think_prefix(self) -> str:
         """Add /no_think for qwen3 models to disable slow reasoning."""
         # Detect qwen3 from provider model name if available
@@ -374,6 +393,10 @@ class StepAgent:
 
     def _build_prompt(self, step: Step, context: dict, attempt: int) -> str:
         """Build a focused prompt for this step."""
+        # ── Simple model: ultra-short prompts for 1-3B parameter models ───────
+        if self._is_simple_model:
+            return self._build_simple_prompt(step, context, attempt)
+
         prefix = self._no_think_prefix()
         lines = [prefix]
 
@@ -481,6 +504,68 @@ class StepAgent:
 
         return "\n".join(lines)
 
+    def _build_simple_prompt(self, step: Step, context: dict, attempt: int) -> str:
+        """Ultra-short prompt for small models (1-3B params) that can't handle complex instructions.
+        No progress tracker, no cross-step context, no tool examples — just the task."""
+        lines = []
+
+        if step.expect == "write_file" and not step.args:
+            filename = context.get("_current_file", self._infer_filename(step.prompt) or "main.py")
+            # Extract function/class name from step prompt if available
+            func_hint = ""
+            import re as _re
+            fn_match = _re.search(r'(?:function|def|class|implement)\s+[`\'"]*(\w+)', step.prompt, _re.IGNORECASE)
+            if fn_match:
+                func_hint = f" for function `{fn_match.group(1)}`"
+
+            # Include plan context if available (but keep it short)
+            plan = context.get("plan_content", "")
+            plan_hint = ""
+            if plan:
+                # Extract just the relevant section (first 400 chars)
+                plan_hint = f"\nProject plan:\n{plan[:400]}\n"
+
+            if attempt > 0:
+                err_key = f"_step_{id(step)}_error"
+                err = context.get(err_key, "syntax error")
+                lines.append(
+                    f"Previous code had error: {err}\n"
+                    f"Write corrected Python code for {filename}{func_hint}.\n"
+                    f"Output ONLY valid Python code. No explanations."
+                )
+            else:
+                lines.append(
+                    f"Write Python code for {filename}{func_hint}.{plan_hint}\n"
+                    f"Output ONLY valid Python code. No explanations, no markdown."
+                )
+
+            # Add already-written pieces as minimal context
+            pieces = context.get("_pieces", [])
+            if pieces:
+                sig_lines = []
+                for p in pieces[-3:]:
+                    name = p.get("name", "")
+                    code = p.get("code", "")
+                    # Just show the def line
+                    for cl in code.splitlines():
+                        if cl.strip().startswith("def ") or cl.strip().startswith("class "):
+                            sig_lines.append(cl.strip())
+                            break
+                if sig_lines:
+                    lines.append("Already written:\n" + "\n".join(sig_lines))
+
+        elif step.expect == "read_file":
+            lines.append(step.prompt)
+
+        elif step.expect == "run_command":
+            lines.append(step.prompt)
+
+        else:
+            # Generic fallback: just the step prompt, stripped down
+            lines.append(step.prompt)
+
+        return "\n".join(lines)
+
     def _filter_tools(self, expect: str | None) -> list[dict]:
         """
         When a step expects a specific tool, only expose that tool + finish.
@@ -526,14 +611,101 @@ class StepAgent:
         return None
 
     def _extract_code_block(self, text: str) -> str | None:
-        """Extract code from markdown code block if model forgot to call write_file."""
-        match = re.search(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        # No code block — return the whole text if it looks like code
-        if any(kw in text for kw in ("def ", "class ", "import ", "from ")):
-            return text.strip()
+        """Extract the BEST code block from model output.
+        Picks the highest-quality block, not just the first one."""
+        # Find all code blocks
+        blocks = re.findall(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
+
+        if not blocks:
+            # No code block — try whole text if it looks like code
+            if any(kw in text for kw in ("def ", "class ", "import ", "from ")):
+                candidate = text.strip()
+                if self._validate_code_quality(candidate):
+                    return candidate
+            return None
+
+        # Score each block and pick the best
+        best, best_score = None, -1
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+            score = self._score_code_block(block)
+            if score > best_score:
+                best, best_score = block, score
+
+        if best and self._validate_code_quality(best):
+            return best
         return None
+
+    @staticmethod
+    def _score_code_block(code: str) -> int:
+        """Score a code block by quality signals. Higher = better."""
+        score = 0
+        lines = code.splitlines()
+        score += min(len(lines), 100)         # length (capped)
+        score += code.count("def ") * 15      # has functions
+        score += code.count("class ") * 15    # has classes
+        score += code.count("return ") * 5    # has returns
+        # Penalties
+        if "write_file" in code:   score -= 50   # recursive tool call = garbage
+        if "pandasas" in code:     score -= 100
+        if "from write_file" in code: score -= 100
+        if "import pandasas" in code: score -= 100
+        # Repetition penalty
+        unique = set(line.strip() for line in lines if line.strip())
+        if len(lines) > 5 and len(unique) < len(lines) * 0.4:
+            score -= 80  # >60% duplicate lines
+        return score
+
+    @staticmethod
+    def _validate_code_quality(code: str) -> bool:
+        """Reject obviously garbage code before writing to disk.
+        Returns True if code passes basic sanity checks."""
+        if not code or len(code.strip()) < 10:
+            return False
+
+        lines = [l for l in code.splitlines() if l.strip()]
+        if not lines:
+            return False
+
+        # ── Reject repetitive content ─────────────────────────────────────────
+        from collections import Counter
+        line_counts = Counter(line.strip() for line in lines)
+        if line_counts and len(lines) > 5:
+            most_common_count = line_counts.most_common(1)[0][1]
+            if most_common_count > len(lines) * 0.5:
+                return False  # >50% identical lines
+
+        # ── Reject recursive tool-call garbage ────────────────────────────────
+        garbage_patterns = [
+            "from write_file import",
+            "from remember import",
+            "from recall import",
+            "from finish import",
+            "import pandasas",
+            "write_file(path=",
+            'write_file("',
+            "write_file('",
+        ]
+        garbage_count = sum(1 for p in garbage_patterns if p in code)
+        if garbage_count >= 2:
+            return False
+
+        # ── Reject excessive non-ASCII in code (Chinese/Portuguese gibberish) ─
+        non_ascii = sum(1 for c in code if ord(c) > 127)
+        if len(code) > 50 and non_ascii / len(code) > 0.15:
+            return False  # >15% non-ASCII = probably garbage
+
+        # ── Must have at least one meaningful construct ───────────────────────
+        has_def   = "def " in code
+        has_class = "class " in code
+        has_assign = "=" in code and "==" not in code.replace("==", "")
+        has_import = "import " in code
+        if not (has_def or has_class or has_assign or has_import):
+            return False
+
+        return True
 
     async def _call_provider(
         self,
