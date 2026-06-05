@@ -253,7 +253,14 @@ class Pipeline:
             iter_data["tester_verdict"] = tester_verdict
 
             # ── Reviewer (starts only after coder_gate is open) ───────────────
-            reviewer      = make_reviewer(**_kwargs("reviewer"))
+            # Delete stale review.md so reviewer produces a fresh review each time.
+            _stale_review = cfg.workspace / "review.md"
+            if _stale_review.exists():
+                _stale_review.unlink()
+
+            reviewer_kwargs = _kwargs("reviewer")
+            reviewer_kwargs["executor"] = _make_reviewer_executor(executor)
+            reviewer      = make_reviewer(**reviewer_kwargs)
             reviewer_task = (
                 f"Original request: {task}\n\n"
                 "Review all code and the test report. Write review.md."
@@ -315,6 +322,30 @@ def _extract_issues(review_summary: str) -> str:
     return review_summary[:600]
 
 
+def _make_reviewer_executor(base_executor):
+    """
+    Wrap executor to block reviewer from writing .py files.
+
+    Qwen models ignore the 'write review.md' instruction and rewrite source
+    files instead.  This guard ensures reviewer can only create .md files,
+    so review.md is always produced (or the auto-review fallback kicks in
+    with correct data instead of a false-positive CRITICAL).
+    """
+    def guarded(name: str, args: dict, memory: dict) -> tuple[str, bool]:
+        if name == "write_file":
+            rel = args.get("path", "").lstrip("/\\")
+            if rel.endswith(".py"):
+                return (
+                    f"Error: As a reviewer you CANNOT write '{rel}'. "
+                    f"Your job is to REVIEW code, not rewrite it.\n"
+                    f'Write your findings to review.md:\n'
+                    f'  write_file(path="review.md", content="# Code Review\\n...")',
+                    False,
+                )
+        return base_executor(name, args, memory)
+    return guarded
+
+
 def _auto_generate_tests(workspace: Path) -> None:
     """
     Auto-generate basic syntax/import tests when the model fails to write tests.
@@ -357,7 +388,6 @@ def _auto_review_code(workspace: Path) -> str:
     Checks: syntax, imports, undefined vars, runtime errors, common issues.
     """
     import ast
-    import subprocess
 
     py_files = [f for f in workspace.rglob("*.py")
                 if "test_" not in f.name and f.name != "__init__.py"
@@ -481,17 +511,11 @@ def _auto_review_code(workspace: Path) -> str:
                 if not node.handlers and not node.finalbody:
                     file_issues.append("CRITICAL: `try` without `except` or `finally`")
 
-        # ── 5. Runtime check — try to compile and run basic import ────────────
-        try:
-            result = subprocess.run(
-                ["python", "-c", f"import ast; ast.parse(open(r'{py_file}').read()); print('syntax_ok')"],
-                cwd=workspace, capture_output=True, text=True, timeout=10
-            )
-            if result.returncode != 0:
-                err = result.stderr.strip().split("\n")[-1] if result.stderr else "unknown"
-                file_issues.append(f"CRITICAL: Runtime check failed: {err}")
-        except Exception:
-            pass
+        # ── 5. Runtime check — REMOVED ────────────────────────────────────────
+        # BUG FIX: previously used py_file (workspace/main.py) with cwd=workspace,
+        # causing open() to look for workspace/workspace/main.py → FileNotFoundError
+        # on EVERY file → false CRITICAL → infinite FAIL loop across all iterations.
+        # Step 1 ast.parse(source) already validates syntax — this was redundant.
 
         # ── 6. TODO/FIXME ─────────────────────────────────────────────────────
         for i, line in enumerate(source.splitlines(), 1):

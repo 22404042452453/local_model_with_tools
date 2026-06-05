@@ -42,6 +42,8 @@ def make_executor(workspace: Path, plugin_registry=None):
 
         # ── File ops ──────────────────────────────────────────────────────────
         elif name == "read_file":
+            if "path" not in args or not args["path"]:
+                return "Error: 'path' argument is required. Example: read_file({\"path\": \"main.py\"})", False
             # Normalize: strip leading slash/backslash (model sometimes sends /plan.md)
             rel = args["path"].lstrip("/\\")
             path = _safe(rel, workspace)
@@ -51,6 +53,10 @@ def make_executor(workspace: Path, plugin_registry=None):
             except Exception as e:    return f"Read error: {e}", False
 
         elif name == "write_file":
+            if "path" not in args or not args["path"]:
+                return "Error: 'path' argument is required. Example: write_file({\"path\": \"main.py\", \"content\": \"...\"})", False
+            if "content" not in args:
+                return "Error: 'content' argument is required.", False
             rel  = args["path"].lstrip("/\\")
             path = _safe(rel, workspace)
             if path is None: return "Error: path escapes workspace.", False
@@ -69,6 +75,8 @@ def make_executor(workspace: Path, plugin_registry=None):
             ), False
 
         elif name == "edit_file":
+            if "path" not in args or not args["path"]:
+                return "Error: 'path' argument is required.", False
             rel  = args["path"].lstrip("/\\")
             path = _safe(rel, workspace)
             if path is None: return "Error: path escapes workspace.", False

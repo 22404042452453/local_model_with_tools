@@ -692,17 +692,22 @@ class StepAgent:
         if garbage_count >= 2:
             return False
 
-        # ── Reject excessive non-ASCII in code (Chinese/Portuguese gibberish) ─
-        non_ascii = sum(1 for c in code if ord(c) > 127)
-        if len(code) > 50 and non_ascii / len(code) > 0.15:
-            return False  # >15% non-ASCII = probably garbage
-
-        # ── Must have at least one meaningful construct ───────────────────────
+        # ── Reject excessive non-ASCII in code (gibberish detection) ──────────
+        # Only reject if code has NO meaningful constructs AND is mostly non-ASCII.
+        # Code with def/class/import + Russian/CJK strings is legitimate.
         has_def   = "def " in code
         has_class = "class " in code
         has_assign = "=" in code and "==" not in code.replace("==", "")
         has_import = "import " in code
-        if not (has_def or has_class or has_assign or has_import):
+        has_meaningful = has_def or has_class or has_assign or has_import
+
+        non_ascii = sum(1 for c in code if ord(c) > 127)
+        if len(code) > 50 and non_ascii / len(code) > 0.15:
+            if not has_meaningful:
+                return False  # High non-ASCII + no code constructs = garbage
+
+        # ── Must have at least one meaningful construct ───────────────────────
+        if not has_meaningful:
             return False
 
         return True

@@ -39,7 +39,7 @@ from core.file_builder import (
 from core.iteration_memory import IterationMemory, build_memory_from_iteration
 from core.providers import make_provider
 from core.step_agent import StepAgent, Step
-from pipeline.pipeline import AgentGate, PipelineResult, _clean_dir, _auto_generate_tests, _auto_review_code
+from pipeline.pipeline import AgentGate, PipelineResult, _clean_dir, _auto_generate_tests, _auto_review_code, _make_reviewer_executor
 from tools.definitions import ARCHITECT_TOOLS, CODER_TOOLS, TESTER_TOOLS, REVIEWER_TOOLS
 from tools.executor import make_executor
 
@@ -360,6 +360,11 @@ class StepPipeline:
 
             # ── Filter: skip files that already work ─────────────────────────
             iteration_files = planned_files or []
+
+            # Filter out test files — tests are the tester's job, not the coder's.
+            # Qwen models can't reliably generate test files, causing infinite loops.
+            iteration_files = [f for f in iteration_files
+                               if not f.split("/")[-1].startswith("test_")]
             if iteration > 0 and _good_files:
                 skipped = [f for f in iteration_files if f in _good_files]
                 iteration_files = [f for f in iteration_files if f not in _good_files]
@@ -701,7 +706,23 @@ class StepPipeline:
 
             # ── Reviewer ───────────────────────────────────────────────────────
 
-            reviewer_agent   = _step_agent("reviewer", REVIEWER_TOOLS, REVIEWER_SYSTEM)
+            # Delete stale review.md from previous iteration — reviewer must
+            # produce a fresh review each time.  Without this, a hallucinated
+            # CRITICAL from iteration N persists forever → infinite FAIL loop.
+            _stale_review = cfg.workspace / "review.md"
+            if _stale_review.exists():
+                _stale_review.unlink()
+
+            # Guard: block reviewer from writing .py files (Qwen ignores prompt)
+            reviewer_executor = _make_reviewer_executor(executor)
+            reviewer_agent = StepAgent(
+                name          = "reviewer",
+                provider      = _provider("reviewer"),
+                tools         = _merge_plugin_tools("reviewer", REVIEWER_TOOLS),
+                executor      = reviewer_executor,
+                system        = _no_think_system("reviewer", REVIEWER_SYSTEM),
+                stream_tokens = cfg.stream_tokens,
+            )
             reviewer_context: dict = {"_memory": {}}
             reviewer_step_list = reviewer_steps(task, cfg.workspace)
             _t0_reviewer = _time.perf_counter()
