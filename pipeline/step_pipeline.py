@@ -685,28 +685,30 @@ class StepPipeline:
     
                 tester_agent   = _step_agent("tester", TESTER_TOOLS, TESTER_SYSTEM)
                 tester_context: dict = {"_memory": {}, "_workspace": str(cfg.workspace)}
+
+                # Always ensure auto-generated tests exist BEFORE tester runs.
+                # Tester no longer writes tests (Qwen can't do it reliably).
+                test_files = (list(cfg.workspace.rglob("test_*.py"))
+                             + list(cfg.workspace.rglob("*_test.py")))
+                if not test_files:
+                    _auto_generate_tests(cfg.workspace)
+                    await self._emit(Event("pipeline", "thought",
+                        {"text": "Auto-generated syntax/import tests"}))
+
                 tester_step_list = tester_steps(task, cfg.workspace)
                 _t0_tester = _time.perf_counter()
                 await tester_agent.run_steps(tester_step_list, tester_context, self._emit)
                 _timing[f"tester_iter{iteration}"] = round(_time.perf_counter() - _t0_tester, 2)
 
-                # Quality gate: tests created?
-                test_files = (list(cfg.workspace.rglob("test_*.py"))
-                             + list(cfg.workspace.rglob("*_test.py")))
-                if not test_files:
-                    await self._emit(Event("pipeline", "agent_start",
-                        {"task": "Auto-generating tests", "stage": "auto_test"}))
-                    _auto_generate_tests(cfg.workspace)
-
-                # Run tests
+                # Run tests (pipeline-level, reliable)
                 tester_verdict, test_output = self._run_tests(cfg.workspace)
-                iter_data["tester"]         = test_output[:300]
+                # Full output — not truncated. IterationMemory needs complete errors.
+                iter_data["tester"]         = test_output
                 iter_data["tester_verdict"] = tester_verdict
-                await self._emit(Event.done("tester", test_output[:200], tester_verdict))
+                await self._emit(Event.done("tester", test_output[:500], tester_verdict))
 
             # ── Reviewer ───────────────────────────────────────────────────────
 
-<<<<<<< HEAD
             # Delete stale review.md from previous iteration — reviewer must
             # produce a fresh review each time.  Without this, a hallucinated
             # CRITICAL from iteration N persists forever → infinite FAIL loop.
@@ -714,8 +716,6 @@ class StepPipeline:
             if _stale_review.exists():
                 _stale_review.unlink()
 
-=======
->>>>>>> ba8b4b5d4fd6a75a83f7d329dea2eb1e3efa5742
             # Guard: block reviewer from writing .py files (Qwen ignores prompt)
             reviewer_executor = _make_reviewer_executor(executor)
             reviewer_agent = StepAgent(
@@ -741,11 +741,12 @@ class StepPipeline:
             review_content = review_file.read_text(encoding="utf-8")
             has_critical   = "CRITICAL" in review_content and "FAIL" in review_content
             review_verdict = "FAIL" if has_critical else "PASS"
-            review_summary = review_content[:300]
+            # Full content for IterationMemory — not truncated
+            review_summary = review_content
 
-            iter_data["reviewer"]         = review_summary
+            iter_data["reviewer"]         = review_summary[:500]  # for UI display only
             iter_data["reviewer_verdict"] = review_verdict
-            await self._emit(Event.done("reviewer", review_summary, review_verdict))
+            await self._emit(Event.done("reviewer", review_summary[:500], review_verdict))
 
             result.iterations.append(iter_data)
 

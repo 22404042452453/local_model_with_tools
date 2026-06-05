@@ -181,7 +181,22 @@ def coder_steps(task: str, workspace: Path,
             validate=_validate_file_written,
         ))
 
-    # Final: verify
+    # Final: self-check — coder verifies its own code compiles
+    steps.append(Step(
+        prompt=(
+            "Verify the code you just wrote compiles correctly.\n"
+            "Run: python -c \"import ast, sys; "
+            "[ast.parse(open(f).read()) for f in sys.argv[1:]]\"\n"
+            "with all .py files as arguments."
+        ),
+        expect="run_command",
+        args={"command": "python -c \"import ast, pathlib; [ast.parse(f.read_text()) for f in pathlib.Path('.').glob('*.py')]\"", "timeout": 15},
+        required=False,
+        max_retries=1,
+        on_result=lambda r, ctx: ctx.update({"self_check": r}),
+    ))
+
+    # Final: list files to confirm
     steps.append(Step(
         prompt="List all files in workspace to confirm they were created.",
         expect="list_files",
@@ -367,6 +382,11 @@ def _validate_skeleton(result: str) -> tuple[bool, str]:
 # ── Tester steps ──────────────────────────────────────────────────────────────
 
 def tester_steps(task: str, workspace: Path) -> list[Step]:
+    """
+    Tester steps: list files, read code, run tests.
+    Tester does NOT write tests — auto_generate_tests in pipeline handles that.
+    Qwen models consistently fail to write valid pytest code, causing infinite loops.
+    """
     return [
         # Step 1: See what code exists
         Step(
@@ -377,7 +397,7 @@ def tester_steps(task: str, workspace: Path) -> list[Step]:
             max_retries=1,
             on_result=lambda r, ctx: ctx.update({"files_list": r}),
         ),
-        # Step 2: Read main source file
+        # Step 2: Read main source file to understand the code
         Step(
             prompt=(
                 f"Task: {task}\n\n"
@@ -389,25 +409,12 @@ def tester_steps(task: str, workspace: Path) -> list[Step]:
             validate=_validate_nonempty,
             on_result=lambda r, ctx: ctx.update({"source_code": r}),
         ),
-        # Step 3: Write test file
-        Step(
-            prompt=(
-                f"Task: {task}\n\n"
-                "Write pytest tests in tests/test_main.py.\n"
-                "Test each function/endpoint individually.\n"
-                "Use write_file(path=\"tests/test_main.py\", content=\"...\") now."
-            ),
-            expect="write_file",
-            required=True,
-            max_retries=3,
-            validate=_validate_file_written,
-        ),
-        # Step 4: Run tests
+        # Step 3: Run tests (auto-generated tests should already exist)
         Step(
             prompt="Run the tests with pytest.",
             expect="run_command",
             args={"command": "python -m pytest tests/ -v --tb=short", "timeout": 60},
-            required=False,
+            required=True,
             max_retries=1,
             on_result=lambda r, ctx: ctx.update({"test_output": r}),
         ),
@@ -417,7 +424,20 @@ def tester_steps(task: str, workspace: Path) -> list[Step]:
 # ── Reviewer steps ────────────────────────────────────────────────────────────
 
 def reviewer_steps(task: str, workspace: Path) -> list[Step]:
-    return [
+    """
+    Reviewer steps: list all files, read each .py file, write review.md.
+    Reviewer reads ALL source files to give a comprehensive review.
+    """
+    # Discover .py files to review (exclude tests, __init__, cache)
+    py_files = sorted(
+        f.name for f in workspace.glob("*.py")
+        if "test_" not in f.name
+        and "__init__" not in f.name
+        and "_skeleton_" not in f.name
+        and "_piece_" not in f.name
+    )
+
+    steps = [
         # Step 1: See all files
         Step(
             prompt="List all files in workspace.",
@@ -427,34 +447,39 @@ def reviewer_steps(task: str, workspace: Path) -> list[Step]:
             max_retries=1,
             on_result=lambda r, ctx: ctx.update({"files_list": r}),
         ),
-        # Step 2: Read main file
-        Step(
-            prompt=(
-                f"Task: {task}\n\n"
-                "Read the main source file to review it."
-            ),
-            expect="read_file",
-            required=True,
-            max_retries=2,
-            validate=_validate_nonempty,
-            on_result=lambda r, ctx: ctx.update({"source_code": r}),
-        ),
-        # Step 3: Write review.md
-        Step(
-            prompt=(
-                f"Task: {task}\n\n"
-                "Write review.md with:\n"
-                "- CRITICAL bugs (wrong imports, missing error handling, logic errors)\n"
-                "- MAJOR issues\n"
-                "- What was done well\n\n"
-                "Use write_file(path=\"review.md\", content=\"# Code Review\\n...\") now."
-            ),
-            expect="write_file",
-            required=True,
-            max_retries=3,
-            validate=_validate_file_written,
-        ),
     ]
+
+    # Step 2..N: Read each .py file
+    for py_file in py_files[:5]:  # cap at 5 files to avoid context overflow
+        steps.append(Step(
+            prompt=f"Read {py_file} to review it.",
+            expect="read_file",
+            args={"path": py_file},
+            required=False,
+            max_retries=1,
+            on_result=lambda r, ctx, fn=py_file: ctx.setdefault("_reviewed_files", {}).__setitem__(fn, r[:2000]),
+        ))
+
+    # Final step: Write review.md
+    steps.append(Step(
+        prompt=(
+            f"Task: {task}\n\n"
+            "Write review.md with:\n"
+            "- VERDICT: PASS or FAIL\n"
+            "- CRITICAL bugs (wrong imports, missing error handling, logic errors)\n"
+            "- MAJOR issues (code quality, missing features)\n"
+            "- What was done well\n\n"
+            "IMPORTANT: Only flag CRITICAL if you actually SAW the bug in the code you just read.\n"
+            "Do NOT hallucinate issues. If imports are correct, say so.\n\n"
+            "Use write_file(path=\"review.md\", content=\"# Code Review\\n...\") now."
+        ),
+        expect="write_file",
+        required=True,
+        max_retries=3,
+        validate=_validate_file_written,
+    ))
+
+    return steps
 
 
 # ── Factory functions ─────────────────────────────────────────────────────────
