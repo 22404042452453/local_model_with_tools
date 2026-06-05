@@ -706,6 +706,7 @@ class StepPipeline:
 
             # ── Reviewer ───────────────────────────────────────────────────────
 
+<<<<<<< HEAD
             # Delete stale review.md from previous iteration — reviewer must
             # produce a fresh review each time.  Without this, a hallucinated
             # CRITICAL from iteration N persists forever → infinite FAIL loop.
@@ -713,6 +714,8 @@ class StepPipeline:
             if _stale_review.exists():
                 _stale_review.unlink()
 
+=======
+>>>>>>> ba8b4b5d4fd6a75a83f7d329dea2eb1e3efa5742
             # Guard: block reviewer from writing .py files (Qwen ignores prompt)
             reviewer_executor = _make_reviewer_executor(executor)
             reviewer_agent = StepAgent(

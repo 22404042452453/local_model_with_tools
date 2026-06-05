@@ -253,11 +253,14 @@ class Pipeline:
             iter_data["tester_verdict"] = tester_verdict
 
             # ── Reviewer (starts only after coder_gate is open) ───────────────
+<<<<<<< HEAD
             # Delete stale review.md so reviewer produces a fresh review each time.
             _stale_review = cfg.workspace / "review.md"
             if _stale_review.exists():
                 _stale_review.unlink()
 
+=======
+>>>>>>> ba8b4b5d4fd6a75a83f7d329dea2eb1e3efa5742
             reviewer_kwargs = _kwargs("reviewer")
             reviewer_kwargs["executor"] = _make_reviewer_executor(executor)
             reviewer      = make_reviewer(**reviewer_kwargs)
