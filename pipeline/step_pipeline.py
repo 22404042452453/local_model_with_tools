@@ -39,7 +39,7 @@ from core.file_builder import (
 from core.iteration_memory import IterationMemory, build_memory_from_iteration
 from core.providers import make_provider
 from core.step_agent import StepAgent, Step
-from pipeline.pipeline import AgentGate, PipelineResult, _clean_dir, _auto_generate_tests, _auto_review_code
+from pipeline.pipeline import AgentGate, PipelineResult, _clean_dir, _auto_generate_tests, _auto_review_code, _make_reviewer_executor
 from tools.definitions import ARCHITECT_TOOLS, CODER_TOOLS, TESTER_TOOLS, REVIEWER_TOOLS
 from tools.executor import make_executor
 
@@ -701,7 +701,16 @@ class StepPipeline:
 
             # ── Reviewer ───────────────────────────────────────────────────────
 
-            reviewer_agent   = _step_agent("reviewer", REVIEWER_TOOLS, REVIEWER_SYSTEM)
+            # Guard: block reviewer from writing .py files (Qwen ignores prompt)
+            reviewer_executor = _make_reviewer_executor(executor)
+            reviewer_agent = StepAgent(
+                name          = "reviewer",
+                provider      = _provider("reviewer"),
+                tools         = _merge_plugin_tools("reviewer", REVIEWER_TOOLS),
+                executor      = reviewer_executor,
+                system        = _no_think_system("reviewer", REVIEWER_SYSTEM),
+                stream_tokens = cfg.stream_tokens,
+            )
             reviewer_context: dict = {"_memory": {}}
             reviewer_step_list = reviewer_steps(task, cfg.workspace)
             _t0_reviewer = _time.perf_counter()
