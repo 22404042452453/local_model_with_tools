@@ -86,6 +86,10 @@ def make_executor(workspace: Path, plugin_registry=None):
             path = _safe(rel, workspace)
             if path is None: return "Error: path escapes workspace.", False
             try:
+                if "find" not in args:
+                    return "Error: 'find' argument is required.", False
+                if "replace" not in args:
+                    return "Error: 'replace' argument is required.", False
                 content = path.read_text(encoding="utf-8")
                 find    = args["find"]
                 replace = args["replace"]
@@ -101,6 +105,8 @@ def make_executor(workspace: Path, plugin_registry=None):
                 return f"Edit error: {e}", False
 
         elif name == "delete_file":
+            if "path" not in args or not args["path"]:
+                return "Error: 'path' argument is required.", False
             rel  = args["path"].lstrip("/\\")
             path = _safe(rel, workspace)
             if path is None: return "Error: path escapes workspace.", False

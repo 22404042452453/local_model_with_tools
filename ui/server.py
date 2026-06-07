@@ -76,22 +76,24 @@ async def run_pipeline(body: dict):
     async def _run():
         global _running
         _running = True
-        from pipeline.router import RouterPipeline
-        pipeline = RouterPipeline(_config)
-        queue    = pipeline.subscribe()
+        try:
+            from pipeline.router import RouterPipeline
+            pipeline = RouterPipeline(_config)
+            queue    = pipeline.subscribe()
 
-        async def forward():
-            while True:
-                ev = await queue.get()
-                await _broadcast(ev.to_dict())
-                if ev.type == "pipeline_done":
-                    break
+            async def forward():
+                while True:
+                    ev = await queue.get()
+                    await _broadcast(ev.to_dict())
+                    if ev.type == "pipeline_done":
+                        break
 
-        await asyncio.gather(
-            asyncio.create_task(pipeline.run(task, clean_workspace=clean)),
-            asyncio.create_task(forward()),
-        )
-        _running = False
+            await asyncio.gather(
+                asyncio.create_task(pipeline.run(task, clean_workspace=clean)),
+                asyncio.create_task(forward()),
+            )
+        finally:
+            _running = False
 
     asyncio.create_task(_run())
     return {"started": True}
@@ -129,7 +131,7 @@ async def get_file(file_path: str):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend",   default="anthropic")
+    parser.add_argument("--backend",   default=None)
     parser.add_argument("--model",     default=None)
     parser.add_argument("--url",       default=None)
     parser.add_argument("--host",      default="127.0.0.1")
@@ -139,7 +141,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = Config.from_env()
-    cfg.backend       = args.backend
+    if args.backend: cfg.backend = args.backend
     cfg.host          = args.host
     cfg.port          = args.port
     cfg.workspace     = Path(args.workspace)
@@ -168,21 +170,23 @@ async def run_planner(body: dict):
     async def _run():
         global _running
         _running  = True
-        pipeline  = PlannerPipeline(_config)
-        queue     = pipeline.subscribe()
+        try:
+            pipeline  = PlannerPipeline(_config)
+            queue     = pipeline.subscribe()
 
-        async def forward():
-            while True:
-                ev = await queue.get()
-                await _broadcast(ev.to_dict())
-                if ev.type == "pipeline_done":
-                    break
+            async def forward():
+                while True:
+                    ev = await queue.get()
+                    await _broadcast(ev.to_dict())
+                    if ev.type == "pipeline_done":
+                        break
 
-        await asyncio.gather(
-            asyncio.create_task(pipeline.run(task)),
-            asyncio.create_task(forward()),
-        )
-        _running = False
+            await asyncio.gather(
+                asyncio.create_task(pipeline.run(task)),
+                asyncio.create_task(forward()),
+            )
+        finally:
+            _running = False
 
     asyncio.create_task(_run())
     return {"started": True, "mode": "planner"}
